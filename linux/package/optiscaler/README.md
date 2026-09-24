@@ -1,0 +1,237 @@
+# DLSS Neural Rendering on AMD, through OptiScaler
+
+OptiScaler's DLSS-NR forks already know how to find a game's colour, depth and motion vectors, encode
+a display-referred proxy, run a Neural Rendering model over it and composite the answer back. What
+they do not have is a model that runs on a Radeon: they reach NVIDIA's `nvngx_dlssnr.dll`, and that
+snippet is Blackwell-only.
+
+This replaces the model, not OptiScaler. OptiScaler is not modified, not rebuilt and not patched — it
+loads the same file names it always loads, calls the same entry points in the same order, and gets
+our network on the AMD card instead of NVIDIA's on theirs.
+
+## Two lineages, two doors, one model
+
+The fork split, and the two halves reach feature 18 differently. Both are answered.
+
+| lineage | how it reaches the model | what it loads |
+| --- | --- | --- |
+| **wilsjo2 ≥ 0.8.1** (`OptiScaler-NR-v0.8.4.zip`, **the bundled one**) | `NVSDK_NGX_D3D12_CreateFeature(cmdList, (NVSDK_NGX_Feature) 18, params, &feature)` on the NGX core, then `D3D12_EvaluateFeature` / `D3D12_ReleaseFeature`. Vulkan: `VULKAN_CreateFeature1` / `VULKAN_EvaluateFeature` / `VULKAN_ReleaseFeature`. | **`_nvngx.dll` only.** Its `INSTALL-DLSSNR.md` says "No NR helper DLL is required; remove the obsolete `nvngx.dll_dlssnr.dll` when upgrading." |
+| **Dagherbou** (`OptiScaler-DLSSNR-v0.2.0.zip`) | `dlssnr_call_create` / `_evaluate` / `_release` / `_set_extras` / `_probe_float` / `_set_float_slot` in a forwarder DLL beside itself. | `nvngx.dll_dlssnr.dll`, with `nvngx_dlssnr.dll` as a presence check, plus `_nvngx.dll` for the parameter block. |
+
+Behind both doors is one body of code, `linux/src/pe/nr_dlssnr_model.cpp`: one `nr::pe::Session` per graphics
+API, a feature handle carrying the extent and the six controls, a seed copy of colour into output, and
+`Session::run_after` (D3D12) or `Session::run_vulkan`. `linux/src/pe/nr_ngx_core.cpp` and
+`linux/src/pe/nr_dlssnr_forwarder.cpp` are the two ABIs over it and nothing else. A process that somehow
+loaded both would still build one network: the core checks for `nvngx.dll_dlssnr.dll` in its module
+list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its exports if it is there.
+
+## What goes in the game folder
+
+| file | what it is | where it comes from |
+| --- | --- | --- |
+| `dxgi.dll` | OptiScaler itself, renamed | the release archive, renamed as its own `setup_linux.sh` would |
+| `OptiScaler.ini` | its configuration | the release archive, four keys rewritten (below) |
+| `OptiScaler/`, `docs/`, `Licenses/` | its FSR/XeSS libraries and papers | the release archive, untouched |
+| **`_nvngx.dll`** | **the NGX core, and feature 18** | `linux/build/build_optiscaler_nr.sh` |
+| **`nvngx.dll_dlssnr.dll`** | **the forwarder, for the older lineage** | same |
+| **`nvngx_dlssnr.dll`** | **a byte copy of the forwarder** | same |
+| `build/`, `artifacts/` | the network's SPIR-V and its ~290 MB of weights | `linux/build/build_package.sh`'s package |
+
+`install_optiscaler_nr.sh` in this directory does all of it, and so does the package's own
+`install.sh <game-dir> optiscaler`:
+
+```
+linux/package/optiscaler/install_optiscaler_nr.sh <game-dir> <OptiScaler-*.zip> [dxgi.dll]
+```
+
+The release that ships:
+
+- <https://github.com/wilsjo2/OptiScaler/releases> — `OptiScaler-NR-v0.8.4.zip`
+- sha256 `8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4`
+- source tag `v0.8.4`, HEAD `8802b2b`, cloned to
+  `artifacts/ref/wilsjo2-OptiScaler-DLSSNR-PreSR-Multipass`
+
+It is a binary release: `OptiScaler.dll` (26 MB), `OptiScaler.ini`, the `OptiScaler/` library folder,
+`docs/`, `Licenses/`, `setup_linux.sh` / `setup_windows.bat`, the `!! EXTRACT ALL FILES TO GAME
+FOLDER !!` marker, and `SHA256SUMS.txt`. **It ships no `nvngx.dll_dlssnr.dll` at all** — confirmed by
+listing the archive and by `grep -rni 'nvngx.dll_dlssnr' ` over its source tree, whose only hit is the
+line telling users to delete it. Set `NR_OPTI_ZIP=` to bundle the other lineage instead.
+
+## Why three DLLs and not one
+
+**`_nvngx.dll`** is the one that matters now. It has two jobs.
+
+*The parameter block.* Every fork needs one and will only take the core's capability block:
+`NVNGXProxy::InitDx12(device)` and then `D3D12_GetCapabilityParameters()`, and it gives up if either
+declines. Ownership of the returned block transfers to the caller, which frees it through our
+`DestroyParameters`. The block is not a C++ class deriving from the SDK's `NVSDK_NGX_Parameter`: MSVC
+lays overloaded virtuals out in reverse declaration order and GCC does not, so the vtable is written
+out by hand in MSVC's order (`linux/src/pe/nr_ngx_abi.hpp` has the table and the evidence).
+
+*Feature 18.* `NVSDK_NGX_D3D12_CreateFeature` reads `DLSSNR.Width` / `.Height` /
+`.Hint.Render.Preset` / `.UICorrection` and the six controls out of that block — directly out of its
+own `std::map`, since the block is ours, with a fall-back through the published vtable for a block
+from anywhere else — builds a feature and returns Success with a non-null handle. Two rules come from
+the caller and neither is optional:
+
+- **Create must succeed with a handle.** `DlssNr_Proxy.cpp:180` falls back to
+  `DlssNr_CompatibilityRuntime` — which `LoadLibraryExW`s NVIDIA's own `nvngx_dlssnr.dll` — when and
+  only when create fails *and* leaves the handle null. On an AMD machine that must never fire. (If it
+  ever did it would find our forwarder under that name, which exports no `NVSDK_NGX_D3D12_Init_Ext`,
+  and give up with "is missing required NR exports", preserving our failure rather than running an
+  NVIDIA snippet. Safe, but not the intended path.)
+- **Handles must be unique in both pointer and `Id`.** `DlssNrFeature_Vk_Model.cpp:111-126` fails the
+  whole pass if a second create answers with either one already in use, because identical-profile
+  multi-pass layers still need independent temporal histories. The handle is the first member of the
+  feature object and `Id` is a process-wide counter.
+
+`EvaluateFeature` re-reads everything every call, which is how the caller drives it: `DLSSNR.Color`,
+`.Depth`, `.MVec`, `.Output`, the four subrect quartets, `.DepthInverted`, `.Reset`, `.MVecScaleX/Y`
+and the six controls.
+
+**`nvngx.dll_dlssnr.dll`** is Dagherbou's door. `shaders/dlssnr/DlssNr_Dx12.cpp` there looks for
+exactly that name beside OptiScaler, then beside the executable, resolves `dlssnr_call_*` /
+`dlssnr_vk_*` and drives the pass through them. Ours exports 28 symbols — their 25 plus the pre-SR
+fork's `dlssnr_call_evaluate_v2`, `dlssnr_vk_evaluate_v2` and `dlssnr_call_error` — with the same
+signatures, and runs the same model.
+
+On NVIDIA this file exists for a reason that does not apply here: NVIDIA's snippet resolves the
+module that owns its caller's return address and rejects anything whose path does not contain
+`nvngx.dll`. There is no snippet on our side and no caller gate. The name is kept only because it is
+what OptiScaler looks for.
+
+**`nvngx_dlssnr.dll`** is a presence check in the older fork, which searches for a file by that name
+and gives up with *"nvngx_dlssnr.dll was not found beside OptiScaler or the game"* if it is absent. On
+NVIDIA it is the 165 MB model out of a driver package. Here it is a byte copy of the forwarder, and on
+the normal path nothing ever loads it.
+
+## The multi-pass rule, and the one thing one Session cannot do
+
+wilsjo2's `Passes` slider creates **one NGX feature per pass** — up to 3 by default, 30 with
+`UnlockPasses` — and keeps every handle alive, chaining their outputs through a ping-pong scratch
+texture. Each pass gets its own capability parameter block and its own profile; pass 2 and later
+always get `LocalToneStrength = 0`.
+
+Every create here therefore returns a distinct handle. What one `nr::pe::Session` cannot give them is
+a temporal history each: `nr::Runtime` owns exactly one history image. Left alone, pass 2 would read
+the history pass 1 wrote *in the same game frame* — its own input, one blend earlier — and the
+temporal term would compound with itself.
+
+So **the first handle created on a session keeps the history; every later one is evaluated with reset
+forced on**, never reads the shared history, and runs as a pure spatial enhancement. It still writes,
+and the owner reads that write next frame, so the history holds the last pass's picture rather than
+the first's. That is a limitation of this side, not of the reference, and it is logged once, the first
+time a second handle appears.
+
+## The ini keys, and the one that is deliberately left alone
+
+Written by the installer into the archive's own `OptiScaler.ini`. All four ship as `<key>=auto` in
+v0.8.4 and are rewritten in place; a key that has been renamed upstream shows up as an error rather
+than as a silently ignored line.
+
+```ini
+[DlssNr]
+Enabled=true
+
+[Libraries]
+NvngxPath=<game-dir>\_nvngx.dll
+
+[Spoofing]
+Dxgi=true
+StreamlineSpoofing=true
+```
+
+- `[DlssNr] Enabled` — the key name is `Enabled` inside section `DlssNr`, not `DlssNrEnabled`
+  (`Config.cpp`: `readBool("DlssNr", "Enabled")`). Default (auto) is `false`.
+- `[Libraries] NvngxPath` — `Util::LoadProxyLibrary` accepts a directory (it appends `_nvngx.dll`,
+  the first of the two names it tries) or a full file path. The file path is written so there is no
+  ambiguity about which name it picks up.
+- `[Spoofing] Dxgi` already defaults to true on an AMD card ("Default (auto) is true for AMD/Intel"),
+  and `SpoofedVendorId` / `SpoofedDeviceId` already default to NVIDIA and a 4090. They are written
+  out explicitly only so an inherited ini cannot have turned them off.
+- **`[DlssNr] RunBeforeSR` is left at the release default** (`auto`, which is `false`): NR runs after
+  the upscaler, where the official pipeline puts it. It is a live control in OptiScaler's own overlay
+  and choosing it here would override a decision that is the user's.
+- **`[Upscalers] Dx12Upscaler` is left at `auto` on purpose.** Left alone it picks FSR4 on a capable
+  Radeon and XeSS otherwise, which is OptiScaler's own choice; pinning it here would override a
+  decision that has nothing to do with Neural Rendering.
+
+## What the core does not do
+
+It does not make OptiScaler think real DLSS is available, and it could not if it tried.
+`GetUpscalerBackend` needs `NVNGXProxy::IsDx12Inited() && primaryGpu.dlssCapable`, and
+`dlssCapable` comes from `misc/IdentifyGpu.cpp`:
+
+```cpp
+gpuInfo.dlssCapable = gpuInfo.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100;
+```
+
+`nvidiaArchInfo` is filled by `NvAPI_GPU_GetArchInfo` on a physical GPU handle matched by LUID
+through the real `nvapi64.dll`. On a Radeon that handle is never found, the struct stays zero, and
+the flag is false. Nothing in a parameter block, and nothing this core returns, feeds that decision.
+
+Going the other way: on the path a *game* sees, OptiScaler runs `InitNGXParameters` over whatever
+block we hand back, and its first line is `Set("SuperSampling.Available", 1)` — it tells the game
+DLSS *is* available so the game asks for it and OptiScaler can substitute FSR or XeSS. That is
+deliberate on their side and we do not fight it.
+
+## What the diagnostics will say
+
+`docs/NR-INITIALIZATION-DIAGNOSTICS.md` in the release describes `NgxDiagnostics::RuntimeReport`,
+which runs before and after `CreateFeature(18)` with `[Log] LogLevel=2`. It **queries the core for
+nothing**: it logs the device and command-list LUIDs, `GetDeviceRemovedReason`, `GetNodeCount`, the
+path/size/version of the loaded dispatcher (our `_nvngx.dll` — it has no VERSIONINFO resource, so that
+field reads `unknown`), the size and SHA-256 of every `nvngx_dlssnr.dll` candidate it can find, and
+whether a module by that name is in the process list. On our path it is not, so it always logs
+`nvngx_dlssnr.dll is not present in the process module list` — a log line with no effect on behaviour.
+
+The one real interface obligation is the logging callback in `NVSDK_NGX_FeatureCommonInfo`, which the
+diagnostics installs over the game's. We accept the struct and never call the callback; NGX logging
+is optional and there is nothing NVIDIA-shaped to relay.
+
+## Where the pass runs, and what that means for the picture
+
+Immediately after the game's upscaler by default, on the game's own command list, before the UI is
+drawn. OptiScaler hands us a *display-referred proxy* it has already tone-mapped, not the game's
+linear-light buffer — so the runtime is told not to encode it a second time
+(`Session::EngineResources::colour_encoded`). Blending the answer back into the frame, including
+`TransferStrength` and `ColourStrength`, is entirely OptiScaler's resolve shader and is not touched
+here.
+
+Nothing is recorded into the command list at create: NGX builds its feature there, whereas
+`nr::Runtime` is built on the session's own queue on a background thread. The caller already allows
+for that — it returns without evaluating after a create and waits a submission epoch — and the first
+frames pass through as an exact copy of the input either way, which composites to exactly the proxy.
+
+## What is not implemented
+
+- **Native D3D11.** `dlssnr_d3d11_probe` returns 0, the reference's "no such surface" answer, and
+  OptiScaler keeps routing D3D11 games through its existing Dx11-on-Dx12 bridge, which ends in the
+  D3D12 path above. `NVSDK_NGX_D3D11_CreateFeature` likewise still declines feature 18.
+- **`dlssnr_query_scaling_ratio`** returns 0, "the callback was never published". The network is
+  same-resolution by construction, so there is no ratio to report; OptiScaler logs it and runs at
+  native.
+- **`DLSSNR.GlobalToneStrength`** is read and ignored. So is it in the reference: a scan of
+  `nvngx_dlssnr.dll` for `DLSSNR.*` yields 61 names and this is not one of them, which is why
+  wilsjo2's own `DlssNr_Common.h` leaves the constant commented out and never writes it. Our network
+  has no such control either — `nr::Controls` carries `local_tone`, which is a different thing.
+- **`DLSSNR.UICorrection`, `.UI`, `.UIAlpha`, `.Backbuffer`** and their twelve subrect keys are read
+  and ignored: there is no UI-correction pass on this side, and the caller writes null and zero for
+  all of them anyway.
+- **A non-zero subrect origin.** The pass can express a subrect *extent* but not an origin; a guide
+  whose data starts at a non-zero corner is read as the whole allocation, said once in the log rather
+  than silently. The caller always writes origin 0 for colour and output, and real origins only for
+  depth and motion.
+- **Vulkan needs a queue it has no way to ask for.** `NVSDK_NGX_VULKAN_Init*` carries the instance,
+  the physical device and the device, but no queue, and constructing `nr::Runtime` has to submit the
+  weight upload. The device watcher (`linux/src/pe/nr_pe_vkdevice.cpp`) hooks `vkGetDeviceQueue` and
+  remembers what the game asked for, which only works if it was installed before the game created its
+  device. When it has nothing the Vulkan path declines and says so, rather than calling
+  `vkGetDeviceQueue` on a family the game may never have requested.
+
+## Nothing here has run a frame
+
+Every GPU-side claim in this document is a reading of source, not a measurement. The DLLs build and
+export what they should — 50 `NVSDK_NGX_*` from `_nvngx.dll`, 28 `dlssnr_*` from the forwarder —
+and the installer's dry run puts the right files in the right places; whether a game comes up, and
+what the picture looks like, is unknown until one is launched.

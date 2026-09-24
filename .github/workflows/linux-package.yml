@@ -1,0 +1,67 @@
+# Builds the Linux packages (x86_64 and i686) on every push and pull request, and attaches them to a
+# GitHub release when a v* tag is pushed. The version in the package names comes from the tags
+# (linux/build/version.sh). The packages contain no model: install.sh --dll extracts it from the
+# user's own nvngx_dlssnr.dll.
+#
+# The Windows package is deliberately not built here; see README.md for building it yourself.
+name: Linux package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the tags, for the version
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 python3
+
+      - name: Cache pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain
+            artifacts/ref
+          key: deps-${{ hashFiles('fetch_deps.sh') }}
+
+      - name: Fetch dependencies
+        run: bash fetch_deps.sh
+
+      - name: Build the Vulkan loader
+        run: bash linux/build/build_vulkan_loader.sh
+
+      - name: Build packages
+        run: |
+          NR_ARCH=x86_64 bash linux/build/build_package.sh
+          NR_ARCH=i686 bash linux/build/build_package.sh
+
+      - name: Check that no model was packaged
+        run: |
+          for f in linux/package/*.tar.gz; do
+            if tar -tzf "$f" | grep -q 'dlssnr\.bin$'; then echo "model found in $f" >&2; exit 1; fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: linux/package/*.tar.gz
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" linux/package/*.tar.gz --title "$GITHUB_REF_NAME" --generate-notes

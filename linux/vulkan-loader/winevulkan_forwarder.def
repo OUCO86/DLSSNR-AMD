@@ -1,0 +1,8 @@
+LIBRARY winevulkan.dll
+EXPORTS
+    vkGetInstanceProcAddr=vulkan-1.vkGetInstanceProcAddr
+    vkGetDeviceProcAddr=vulkan-1.vkGetDeviceProcAddr
+    vkEnumerateInstanceExtensionProperties=vulkan-1.vkEnumerateInstanceExtensionProperties
+    vkEnumerateInstanceLayerProperties=vulkan-1.vkEnumerateInstanceLayerProperties
+    vkEnumerateInstanceVersion=vulkan-1.vkEnumerateInstanceVersion
+    vkCreateInstance=vulkan-1.vkCreateInstance
