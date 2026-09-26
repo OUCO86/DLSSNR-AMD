@@ -12,23 +12,28 @@
 # Without a route a menu is shown.
 #
 # If the package has no model file, point --dll at NVIDIA's nvngx_dlssnr.dll (310.8.0, or a
-# zip containing it); the model is extracted from it during installation.
+# zip containing it); the model is extracted from it during installation and kept in this
+# package's dlssnr-amd/, so later installs from this package (into other games too) need no --dll.
 #
 # Every installed file is listed in dlssnr-amd-install.txt in the game folder; remove deletes by it.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 model_name=dlssnr.bin
+# The package's model: bundled, or kept there by the first --dll install. Checked by SHA256.
+pkg_model=$here/dlssnr-amd/$model_name
+model_sha256=2b41c888cf4155b8958c665ba64018ab0bd25c85fc71a2b6db86d0d04d1f7fbd
+model_ok() { [[ -f "$1" && "$(sha256sum -- "$1" | cut -d' ' -f1)" == "$model_sha256" ]]; }
 
 game="" route="" dll=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dll) dll=${2:?--dll needs a file path}; shift 2;;
-        -h|--help) sed -n '2,17p' "$0"; exit 0;;
+        -h|--help) sed -n '2,18p' "$0"; exit 0;;
         *) if [[ -z "$game" ]]; then game=$1; elif [[ -z "$route" ]]; then route=$1;
            else echo "unexpected argument: $1" >&2; exit 1; fi; shift;;
     esac
 done
-[[ -n "$game" ]] || { sed -n '2,17p' "$0"; exit 1; }
+[[ -n "$game" ]] || { sed -n '2,18p' "$0"; exit 1; }
 [[ -d "$game" ]] || { echo "no such folder: $game" >&2; exit 1; }
 game=$(cd -- "$game" && pwd)
 manifest="$game/dlssnr-amd-install.txt"
@@ -86,15 +91,28 @@ esac
 if [[ "$route" == optiscaler && ! -d "$here/optiscaler" ]]; then
     echo "The OptiScaler route is only in the 64-bit package." >&2; exit 1
 fi
-if [[ ! -f "$here/dlssnr-amd/$model_name" && -z "$dll" ]]; then
-    echo "The package has no model file: point --dll at nvngx_dlssnr.dll (310.8.0) or its zip." >&2; exit 1
-fi
-model_tmp=""
-if [[ ! -f "$here/dlssnr-amd/$model_name" ]]; then
+model_src=""
+if [[ -f "$pkg_model" ]] && model_ok "$pkg_model"; then
+    :   # the package has the model; it is installed with dlssnr-amd/
+elif [[ -n "$dll" ]]; then
     model_tmp=$(mktemp)
-    trap 'rm -f -- "$model_tmp"' EXIT
+    trap 'rm -f -- "$model_tmp" "$pkg_model.part"' EXIT
     echo "Extracting the model from $dll ..."
     bash "$here/model-tools/extract_model.sh" "$dll" "$model_tmp"
+    if model_ok "$model_tmp" && cp -- "$model_tmp" "$pkg_model.part" && mv -f -- "$pkg_model.part" "$pkg_model"; then
+        chmod 644 -- "$pkg_model"
+        echo "The model is kept in $pkg_model; later installs from this package need no --dll."
+    else
+        rm -f -- "$pkg_model.part"
+        echo "Note: the model could not be kept in $pkg_model (package folder not writable?); the next install needs --dll again." >&2
+        model_src=$model_tmp
+    fi
+elif [[ -f "$pkg_model" ]]; then
+    echo "$pkg_model is damaged or from another version; extract it again with --dll." >&2; exit 1
+else
+    echo "The package has no model file: point --dll at nvngx_dlssnr.dll (310.8.0) or its zip." >&2
+    echo "Only the first time: the extracted model is kept in this package's dlssnr-amd/ and used by later installs." >&2
+    exit 1
 fi
 if [[ -f "$manifest" ]]; then
     echo "Found a previous installation, removing it first."
@@ -106,7 +124,7 @@ fi
 
 : > "$manifest"; record "dlssnr-amd-install.txt"
 put_tree "$here/dlssnr-amd" dlssnr-amd
-[[ -n "$model_tmp" ]] && cp -- "$model_tmp" "$game/dlssnr-amd/$model_name"
+[[ -n "$model_src" ]] && cp -- "$model_src" "$game/dlssnr-amd/$model_name"
 
 case "$route" in
     optiscaler)

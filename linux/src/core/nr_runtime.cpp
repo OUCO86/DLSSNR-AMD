@@ -726,6 +726,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     std::string why;
     if (!s.ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why))
         throw std::runtime_error("NR device unsupported: " + why);
+    s.ctx.queue_lock = host.queue_lock; s.ctx.queue_unlock = host.queue_unlock;
     s.ctx.require_matrix_config();
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
@@ -1088,6 +1089,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     impl_->post_alpha = NR_POST_ALPHA && impl_->native_compose && !impl_->scaled &&
                         impl_->max_passes == 1 && s.kern.count("fswinimagepost32");
     timer.mark("adapters");
+    // Built: from here on the caller serialises this runtime's submits itself.
+    s.ctx.queue_lock = nullptr; s.ctx.queue_unlock = nullptr;
     nr::logf("[nr] runtime %ux%u built in %.2fs: %s", config.width, config.height, timer.total(),
              timer.text().c_str());
 }

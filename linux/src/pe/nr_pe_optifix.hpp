@@ -7,8 +7,11 @@
 // 2. Finished Picture on DXVK/vkd3d-proton: see fix_finished_picture in nr_pe_optifix.cpp.
 // 3. A 0 x 0 (window-sized) swapchain taken for an overlay and never wrapped (Helldivers 2): see
 //    fix_window_sized_swapchain.
-// 4. A D24S8 depth guide copied into an R24X8 texture, which hangs the GPU under vkd3d-proton
-//    (Helldivers 2, Kingdom Come: Deliverance II): see fix_d24s8_guide.
+// 4. A D24S8 or D32S8 depth guide copied into a colour texture, which can hang the GPU under
+//    vkd3d-proton (Helldivers 2, Kingdom Come: Deliverance II, S.T.A.L.K.E.R. 2): see
+//    fix_depth_stencil_guide.
+// 6. A feature released while the GPU still has its work - its timestamp heaps freed under a pending
+//    list (S.T.A.L.K.E.R. 2's first FSR context): see release_hold.
 // 5. IsHDR clear but AutoExposure set on a float colour (007 First Light, Helldivers 2): treated as
 //    linear HDR so OptiScaler encodes it: see fix_autoexposure_hdr.
 //

@@ -9,6 +9,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <vector>
+
+#include <d3d12.h>
+
+#include "MinHook.h"
 
 namespace nr::pe {
 
@@ -339,20 +345,21 @@ void fix_window_sized_swapchain(const Module& m) {
         m.name, static_cast<unsigned long long>(site - m.base));
 }
 
-// ---- 4. D24S8 depth is not cloned into an R24X8 colour texture -----------------------------------
+// ---- 4. A depth/stencil depth is not cloned into a colour texture --------------------------------
 //
 // DlssNr_Dx12::State::TypedGuideFormat maps a typeless guide to a typed one, and ReadableGuide then
 // creates a plain texture in that format (no depth-stencil flag) and CopyResource-s the game's guide
-// into it. For R24G8_TYPELESS (a D24S8 depth buffer) the copy target is R24_UNORM_X8_TYPELESS - a
-// shader-view format that is not a valid plain texture in D3D12. Under vkd3d-proton, where AMD's
-// D24S8 is emulated, that copy hangs the GPU: Helldivers 2 and Kingdom Come: Deliverance II stalled
-// ~2.6 s on NR's first frame and the device was reset ("cloned a typeless guide as format 46" just
-// before). D32S8 games (007 First Light, R32_FLOAT_X8X24) are not affected.
+// into it. For a depth/stencil buffer the copy target is a shader-view format that is not a valid
+// plain texture in D3D12: R24_UNORM_X8_TYPELESS for R24G8_TYPELESS (D24S8), R32_FLOAT_X8X24_TYPELESS
+// for R32G8X24_TYPELESS (D32S8). Under vkd3d-proton that copy can hang the GPU: Helldivers 2 and
+// Kingdom Come: Deliverance II (D24S8, "cloned a typeless guide as format 46") and S.T.A.L.K.E.R. 2
+// (D32S8, "... as format 21", with our evaluate recording nothing) lost the device on NR's first
+// frame. 007 First Light went through the same D32S8 copy without a hang.
 //
-// The fix returns R24G8_TYPELESS unchanged, so the depth is not treated as typeless and is handed on
-// as it is: no clone, no copy. Our side then runs without that depth (it has no view for a D24S8
-// resource yet), which only weakens the history's disocclusion test; the other guides are untouched.
-void fix_d24s8_guide(const Module& m) {
+// The fix returns both formats unchanged, so the depth is not treated as typeless and is handed on
+// as it is: no clone, no copy. Our side reads the depth aspect of the game's own buffer
+// (nr_pe_interop.cpp depth_stencil_format, runtime_depth.comp); the other guides are untouched.
+void fix_depth_stencil_guide(const Module& m) {
     // TypedGuideFormat, v0.8.4: a jump table over (f - 9), eight `mov eax,<typed>; ret` cases and the
     // default `mov eax,edx; ret`. The R24G8_TYPELESS (44) case returns 46 (R24_UNORM_X8_TYPELESS).
     static const uint8_t pat[] = {
@@ -374,20 +381,21 @@ void fix_d24s8_guide(const Module& m) {
         "xxxxxx" "xxxxxx" "xxxxxx" "xxxxxx" "xxxxxx" "xxxxxx" "xxxxxx" "xxxxxx" "xxx";
     static_assert(sizeof(pat) == sizeof(mask) - 1, "pattern and mask lengths");
     constexpr size_t kR24 = 39 + 12;            // the `mov eax,0x2e` of the R24G8 case
+    constexpr size_t kR32 = 39 + 18;            // the `mov eax,0x15` of the R32G8X24 case
 
     uint8_t* hit = nullptr;
     const int hits = find_unique(m, pat, mask, sizeof(pat), [](uint8_t*) { return true; }, &hit);
     if (hits != 1) {
-        log("[nr] OptiScaler fix (D24S8 guide): %d matching sites in %ls, nothing changed", hits, m.name);
+        log("[nr] OptiScaler fix (depth/stencil guide): %d matching sites in %ls, nothing changed", hits, m.name);
         return;
     }
     static const uint8_t fix[] = {0x8B, 0xC2, 0x90, 0x90, 0x90};   // mov eax,edx (the format) ; nops
-    if (!write_code(hit + kR24, fix, sizeof(fix))) {
-        log("[nr] OptiScaler fix (D24S8 guide): VirtualProtect failed (%lu)", GetLastError());
+    if (!write_code(hit + kR24, fix, sizeof(fix)) || !write_code(hit + kR32, fix, sizeof(fix))) {
+        log("[nr] OptiScaler fix (depth/stencil guide): VirtualProtect failed (%lu)", GetLastError());
         return;
     }
-    log("[nr] OptiScaler fix: a D24S8 depth guide is passed on as it is, not copied into an R24X8 texture "
-        "(%ls+0x%llx)", m.name, static_cast<unsigned long long>(hit + kR24 - m.base));
+    log("[nr] OptiScaler fix: a D24S8/D32S8 depth guide is passed on as it is, not copied into a colour "
+        "texture (%ls+0x%llx)", m.name, static_cast<unsigned long long>(hit + kR24 - m.base));
 }
 
 // ---- 5. AutoExposure marks a float colour as linear HDR ----------------------------------------
@@ -454,6 +462,213 @@ void fix_autoexposure_hdr(const Module& m) {
         static_cast<unsigned long long>(at - m.base));
 }
 
+// ---- 6. A released feature outlives the GPU work recorded for it -------------------------------
+//
+// NVSDK_NGX_D3D12_ReleaseFeature erases the feature from Dx12Contexts at once, and with it the
+// feature's shaders and their GpuTime_Dx12 timestamp heaps - whether or not the GPU has executed
+// what that feature recorded. S.T.A.L.K.E.R. 2 destroys its first FSR context (ffxDestroyContext ->
+// ReleaseFeature) right after presenting the first frame that used it: vkd3d-proton frees the query
+// pools, the frame's own list then writes its timestamps into unmapped memory and waits on them
+// (CmdCopyQueryPoolResults, WAIT_REG_MEM), and the GPU hangs. RADV_DEBUG=hang reported
+// "Potential use-after-free" on a 6-timestamp pool freed in that ReleaseFeature, with the NR model
+// recording nothing at all (NR_DEBUG_NOOP=1).
+//
+// The fix detours the exported EvaluateFeature and ReleaseFeature (the FSR/XeSS inputs call the
+// same functions internally). After each evaluate a WriteBufferImmediate at the end of the game's
+// list stores a serial in a readback buffer; a ReleaseFeature arriving before the GPU has written
+// the feature's last serial is held, and carried out on a later NGX call once it has - or after
+// kHoldMs, for a list that is never executed. Shutdown carries out everything still held first.
+// The release only reads InHandle->Id, so a held release keeps its own copy of the handle.
+namespace release_hold {
+
+struct Handle { unsigned int id; };   // NVSDK_NGX_Handle
+using EvaluateFn = int (*)(ID3D12GraphicsCommandList*, const Handle*, const void*, void*);
+using ReleaseFn = int (*)(Handle*);
+using ShutdownFn = int (*)();
+using Shutdown1Fn = int (*)(ID3D12Device*);
+
+constexpr uint32_t kSlots = 1024;          // one per evaluated feature, reused round robin
+constexpr DWORD kHoldMs = 5000;
+
+EvaluateFn real_evaluate;
+ReleaseFn real_release;
+ShutdownFn real_shutdown;
+Shutdown1Fn real_shutdown1;
+
+struct Mark { unsigned int id; uint32_t slot, serial; };
+struct Held { Handle* handle; uint32_t slot, serial; DWORD since; };
+
+std::mutex lock;
+ID3D12Device* device;             // the device the marks live on (not owned)
+ID3D12Resource* marks;
+volatile uint32_t* written;       // the readback buffer, mapped for the process's life
+D3D12_GPU_VIRTUAL_ADDRESS marks_va;
+uint32_t serial, next_slot;
+std::vector<Mark> live;           // the last mark of each feature that has been evaluated
+std::vector<Held> held;
+bool logged;
+
+bool reached(uint32_t slot, uint32_t s) { return static_cast<int32_t>(written[slot] - s) >= 0; }
+
+// Releases whose GPU work is done (or that waited long enough); `all` for shutdown.
+std::vector<Handle*> take_ready(bool all) {
+    std::vector<Handle*> out;
+    const DWORD now = GetTickCount();
+    for (size_t i = 0; i < held.size();) {
+        const Held& h = held[i];
+        if (all || reached(h.slot, h.serial) || now - h.since >= kHoldMs) {
+            out.push_back(h.handle);
+            held.erase(held.begin() + static_cast<long>(i));
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+void release_all(const std::vector<Handle*>& handles) {
+    for (Handle* h : handles) {
+        real_release(h);
+        delete h;
+    }
+}
+
+bool ensure_marks(ID3D12GraphicsCommandList* cmd) {
+    ID3D12Device* dev = nullptr;
+    if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return false;
+    dev->Release();                   // the list keeps its device alive
+    if (dev == device) return marks != nullptr;
+    // A new device: nothing recorded for the old one can be tracked any more.
+    live.clear();
+    if (marks) { marks->Release(); marks = nullptr; written = nullptr; }
+    device = dev;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kSlots * sizeof(uint32_t);
+    desc.Height = 1; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            nullptr, IID_PPV_ARGS(&marks))))
+        return false;
+    void* p = nullptr;
+    if (FAILED(marks->Map(0, nullptr, &p)) || !p) { marks->Release(); marks = nullptr; return false; }
+    written = static_cast<volatile uint32_t*>(p);
+    for (uint32_t i = 0; i < kSlots; ++i) written[i] = 0;
+    marks_va = marks->GetGPUVirtualAddress();
+    return true;
+}
+
+int evaluate(ID3D12GraphicsCommandList* cmd, const Handle* handle, const void* params, void* callback) {
+    std::vector<Handle*> ready;
+    {
+        std::lock_guard<std::mutex> g(lock);
+        ready = take_ready(false);
+    }
+    release_all(ready);
+    const int result = real_evaluate(cmd, handle, params, callback);
+    if (!cmd || !handle) return result;
+    std::lock_guard<std::mutex> g(lock);
+    ID3D12GraphicsCommandList2* list2 = nullptr;
+    if (!ensure_marks(cmd) || FAILED(cmd->QueryInterface(IID_PPV_ARGS(&list2))) || !list2) return result;
+    Mark* mark = nullptr;
+    for (Mark& m : live)
+        if (m.id == handle->id) mark = &m;
+    if (!mark) {
+        live.push_back({handle->id, next_slot++ % kSlots, 0});
+        mark = &live.back();
+    }
+    mark->serial = ++serial;
+    const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER p{marks_va + mark->slot * sizeof(uint32_t), mark->serial};
+    const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    list2->WriteBufferImmediate(1, &p, &mode);
+    list2->Release();
+    return result;
+}
+
+int release(Handle* handle) {
+    std::vector<Handle*> ready;
+    {
+        std::lock_guard<std::mutex> g(lock);
+        ready = take_ready(false);
+        if (handle) {
+            for (size_t i = 0; i < live.size(); ++i) {
+                if (live[i].id != handle->id) continue;
+                const Mark m = live[i];
+                live.erase(live.begin() + static_cast<long>(i));
+                if (written && !reached(m.slot, m.serial)) {
+                    held.push_back({new Handle{handle->id}, m.slot, m.serial, GetTickCount()});
+                    if (!logged) {
+                        logged = true;
+                        log("[nr] OptiScaler fix: feature %u released before the GPU finished its work; "
+                            "the release waits for it", handle->id);
+                    }
+                    handle = nullptr;
+                }
+                break;
+            }
+        }
+    }
+    release_all(ready);
+    return handle ? real_release(handle) : 1;   // NVSDK_NGX_Result_Success
+}
+
+void flush_all() {
+    std::vector<Handle*> all;
+    {
+        std::lock_guard<std::mutex> g(lock);
+        all = take_ready(true);
+        live.clear();
+    }
+    release_all(all);
+}
+
+int shutdown() { flush_all(); return real_shutdown(); }
+int shutdown1(ID3D12Device* d) { flush_all(); return real_shutdown1(d); }
+
+}  // namespace release_hold
+
+void fix_release_hold(const Module& m) {
+    auto* module = reinterpret_cast<HMODULE>(m.base);
+    struct { const char* name; void* detour; void** original; } entries[] = {
+        {"NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void*>(&release_hold::evaluate),
+         reinterpret_cast<void**>(&release_hold::real_evaluate)},
+        {"NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void*>(&release_hold::release),
+         reinterpret_cast<void**>(&release_hold::real_release)},
+        {"NVSDK_NGX_D3D12_Shutdown", reinterpret_cast<void*>(&release_hold::shutdown),
+         reinterpret_cast<void**>(&release_hold::real_shutdown)},
+        {"NVSDK_NGX_D3D12_Shutdown1", reinterpret_cast<void*>(&release_hold::shutdown1),
+         reinterpret_cast<void**>(&release_hold::real_shutdown1)},
+    };
+    void* targets[4] = {};
+    for (size_t i = 0; i < 4; ++i) {
+        targets[i] = reinterpret_cast<void*>(GetProcAddress(module, entries[i].name));
+        if (!targets[i]) {
+            log("[nr] OptiScaler fix (held release): %ls exports no %s, nothing changed", m.name, entries[i].name);
+            return;
+        }
+    }
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        log("[nr] OptiScaler fix (held release): MinHook would not start (%d), nothing changed", int(init));
+        return;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (MH_CreateHook(targets[i], entries[i].detour, entries[i].original) != MH_OK) {
+            for (size_t k = 0; k < i; ++k) MH_RemoveHook(targets[k]);
+            log("[nr] OptiScaler fix (held release): %s could not be hooked, nothing changed", entries[i].name);
+            return;
+        }
+    }
+    for (size_t i = 0; i < 4; ++i)
+        if (MH_EnableHook(targets[i]) != MH_OK)
+            log("[nr] OptiScaler fix (held release): %s could not be enabled", entries[i].name);
+    log("[nr] OptiScaler fix: a released feature is kept until the GPU has run its work (%ls+0x%llx)", m.name,
+        static_cast<unsigned long long>(static_cast<uint8_t*>(targets[1]) - m.base));
+}
+
 }  // namespace
 #endif
 
@@ -471,8 +686,9 @@ void fix_optiscaler() {
     fix_extension_query(m);
     fix_finished_picture(m);
     fix_window_sized_swapchain(m);
-    fix_d24s8_guide(m);
+    fix_depth_stencil_guide(m);
     fix_autoexposure_hdr(m);
+    fix_release_hold(m);
 #endif
 }
 

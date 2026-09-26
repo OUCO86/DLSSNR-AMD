@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -48,6 +49,17 @@ struct Context {
     float timestamp_period{};
     std::string gpu_name, driver_name;
     bool device_local_host_visible = false;
+    // A queue borrowed from a host API (vkd3d-proton, DXVK) is externally
+    // synchronised by that API's own lock. When set, the lock is taken around
+    // each submit and nothing else, so a build that spends seconds compiling
+    // pipelines does not hold the game's queue for those seconds.
+    std::function<void()> queue_lock, queue_unlock;
+    void submit(const VkSubmitInfo& si, VkFence fence) {
+        if (queue_lock) queue_lock();
+        const VkResult r = vkQueueSubmit(queue, 1, &si, fence);
+        if (queue_unlock) queue_unlock();
+        NRVK_CHECK(r);
+    }
 
     // The RX 9070 XT. NR_GPU overrides with a physical-device index, which is
     // the only reason to run on anything else: the iGPU at 1002:13c0 shares
@@ -426,7 +438,7 @@ struct Context {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence;
         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        NRVK_CHECK(vkQueueSubmit(queue, 1, &si, fence));
+        submit(si, fence);
         NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
         if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
         vkDestroyFence(device, fence, nullptr);
@@ -552,7 +564,7 @@ struct Context {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence;
         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        NRVK_CHECK(vkQueueSubmit(queue, 1, &si, fence));
+        submit(si, fence);
         NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
         vkDestroyFence(device, fence, nullptr);
         vkDestroyCommandPool(device, pool, nullptr);
@@ -885,7 +897,7 @@ struct Runner {
         NRVK_CHECK(vkResetFences(ctx->device, 1, &fence));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        NRVK_CHECK(vkQueueSubmit(ctx->queue, 1, &si, fence));
+        ctx->submit(si, fence);
         NRVK_CHECK(vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, 30000000000ull));
         uint64_t ts[2] = {0, 0};
         NRVK_CHECK(vkGetQueryPoolResults(ctx->device, queries, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
@@ -1074,7 +1086,7 @@ struct Runner {
         NRVK_CHECK(vkResetFences(ctx->device, 1, &fence));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        NRVK_CHECK(vkQueueSubmit(ctx->queue, 1, &si, fence));
+        ctx->submit(si, fence);
         NRVK_CHECK(vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, 30000000000ull));
         uint64_t ts[2] = {0, 0};
         NRVK_CHECK(vkGetQueryPoolResults(ctx->device, queries, 0, 2, sizeof(ts), ts,

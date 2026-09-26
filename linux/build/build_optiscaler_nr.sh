@@ -57,7 +57,7 @@ source linux/build/arch/rdna4.sh
 "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_ngx_core.cpp -o "$out/ngx_core.o"
-"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
+"$cxx" "${common[@]}" -I"$minhook/include" -c linux/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
 
 # MinHook, for the device watcher the Vulkan path asks for a queue through.
 for unit in hook buffer trampoline; do

@@ -73,9 +73,13 @@ code for the largest kernels than Mesa's ACO does on Linux.
 
 ## Why Vulkan and not HIP/ROCm
 
-- **The code has to run inside the game.** OptiScaler, ReShade and every add-on are Windows DLLs loaded
-  into the game's process; on Linux that process is a Wine/Proton process. There is no ROCm/HIP runtime
-  inside a Wine process. Vulkan is there already, because DXVK and vkd3d-proton are how the game draws.
+HIP could run this network as well - ROCm supports RDNA4 and its WMMA instructions. Vulkan was chosen
+because it fits the job better:
+
+- **The code runs inside the game.** OptiScaler, ReShade and every add-on are Windows DLLs loaded into
+  the game's process; on Linux that process is a Wine/Proton process. Vulkan is there already, because
+  DXVK and vkd3d-proton are how the game draws. HIP would need ROCm installed and a bridge from the
+  Wine process to the Linux runtime.
 - **Same device, no copies.** With Vulkan the network records into the game's own command buffers on
   the game's own device. HIP would need its own context next to the game's Vulkan device, the frame's
   images imported or copied into it, and synchronisation between the two APIs every frame.

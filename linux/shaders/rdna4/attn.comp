@@ -701,7 +701,7 @@ float nr_fast_exp(float x) {
 // coopMatLoad(RowMajor A / ColumnMajor B, stride 16) produces. The lane term
 // and the chunk base are added once; each k step is a literal, which goes
 // into the load's immediate offset instead of two VALU adds per fragment.
-#define NR_QLA_I(i) { const uint nrq = (qal4[i] + k04) + kkl * 4u; \
+#define NR_QLA_I(i) NR_QG(i) { const uint nrq = (qal4[i] + k04) + kkl * 4u; \
     const fe4m3vec4 r0 = act_e4m3x4[nrq], r1 = act_e4m3x4[nrq + 1u]; \
     for (int v = 0; v < 4; ++v) { qfa[cur][i][v] = r0[v]; qfa[cur][i][v + 4] = r1[v]; } \
     NR_QSW_A(i) }
@@ -711,6 +711,22 @@ float nr_fast_exp(float x) {
 // NR_ATTN_QKSWAP (see NR_QM_J and the fused-norm epilogue).
 #ifndef NR_ATTN_QKSWAP
 #define NR_ATTN_QKSWAP 0
+#endif
+#ifndef NR_ATTN_EDGE
+#define NR_ATTN_EDGE 0
+#endif
+#ifndef NR_QKV_DONE
+#define NR_QKV_DONE 0
+#endif
+#if NR_ATTN_EDGE
+#define NR_QDEAD(i) ((((NR_QLIVE) >> (i)) & 1) == 0)
+#else
+#define NR_QDEAD(i) false
+#endif
+#if NR_ATTN_EDGE
+#define NR_QG(i) if ((((NR_QLIVE) >> (i)) & 1) != 0)
+#else
+#define NR_QG(i)
 #endif
 #if NR_ATTN_QKSWAP
 #define NR_QSW_A(i) for (int v = 0; v < 4; ++v) { qfaB[cur][i][v] = r0[v]; qfaB[cur][i][v + 4] = r1[v]; }
@@ -760,7 +776,7 @@ float nr_fast_exp(float x) {
 #else
 #define NR_QM_J(j)  NR_MMA(qacc[ii][j], qfa[pp][ii], qfb[pp][j]);
 #endif
-#define NR_QM_I(i)  { const int ii = i; NR_FOR_J(NR_AN, NR_QM_J) }
+#define NR_QM_I(i)  NR_QG(i) { const int ii = i; NR_FOR_J(NR_AN, NR_QM_J) }
 // Round the accumulator to f16 in place. Component access on a coopmat is
 // allowed and the rounding is bit level, because a float(float16_t(x)) round
 // trip is deleted outright by NIR - two builds differing only in three such
@@ -918,6 +934,51 @@ void main() {
             NR_FRAG_B qfaB[NR_APIPE][NR_AM];
             NR_FRAG_A qfbA[NR_APIPE][4];
 #endif
+#define NR_QKV_LOOP \
+            for (uint k0 = 0u; k0 < pc.C; k0 += uint(NR_AKCHUNK)) { \
+                NR_QK04 \
+                NR_FOR_K(NR_AKF, NR_QPRIME) \
+                NR_FOR_K(NR_AKF, NR_QSTEP) \
+            }
+#if NR_ATTN_KOFF
+#define NR_QK04 const uint k04 = k0 * 4u;
+#else
+#define NR_QK04
+#endif
+#if NR_ATTN_EDGE && NR_IMAGE && NR_AM == 2
+            // A token tile outside the image is zero-filled and the
+            // epilogue below stores constant zeros for it without reading its
+            // accumulators, so its loads and MMAs are dead. The wave's two
+            // tiles give four patterns; each is its own copy of the loop with
+            // the mask a compile-time constant (no per-tile phis).
+            const uint nr_ql2 = (nr_tile_oob(mtok0 / 16u) ? 0u : 1u)
+                              | (nr_tile_oob(mtok0 / 16u + 1u) ? 0u : 2u);
+#if !(NR_USE_FUSED_QK_NORM && NR_ATTN_QKSWAP)
+#error "NR_ATTN_EDGE: the shipping fused-norm QKSWAP epilogue only"
+#endif
+            [[dont_flatten]] if (nr_ql2 == 3u) {
+#define NR_QLIVE 3
+                NR_QKV_LOOP
+#include "attn_qkv_epi.glsl"
+#undef NR_QLIVE
+            } else [[dont_flatten]] if (nr_ql2 == 1u) {
+#define NR_QLIVE 1
+                NR_QKV_LOOP
+#include "attn_qkv_epi.glsl"
+#undef NR_QLIVE
+            } else [[dont_flatten]] if (nr_ql2 == 2u) {
+#define NR_QLIVE 2
+                NR_QKV_LOOP
+#include "attn_qkv_epi.glsl"
+#undef NR_QLIVE
+            } else {
+#define NR_QLIVE 0
+#include "attn_qkv_epi.glsl"
+#undef NR_QLIVE
+            }
+#undef NR_QKV_DONE
+#define NR_QKV_DONE 1
+#else
 #if NR_OOB_SKIP && NR_IMAGE
             // A wave whose every token tile is outside the image would
             // multiply clamped rows that NR_QOOB then zeroes - skip it; the
@@ -926,69 +987,15 @@ void main() {
             for (int i = 0; i < NR_AM; ++i) nr_live = nr_live || !nr_tile_oob(mtok0 / 16u + uint(i));
             [[dont_flatten]] if (nr_live)
 #endif
-            for (uint k0 = 0u; k0 < pc.C; k0 += uint(NR_AKCHUNK)) {
-#if NR_ATTN_KOFF
-                const uint k04 = k0 * 4u;
+#define NR_QLIVE 15
+            NR_QKV_LOOP
+#undef NR_QLIVE
 #endif
-                NR_FOR_K(NR_AKF, NR_QPRIME)
-                NR_FOR_K(NR_AKF, NR_QSTEP)
-            }
             NR_QOOB
 #if NR_USE_FUSED_QK_NORM && NR_ATTN_QKSWAP
-            // A lane owns token lane%16 and dims 8*(lane/16)+0..7 of Q and
-            // K (fragments 0,1 = Q dims 0-15,16-31; 2,3 = K). The old tree, per
-            // token: s_d = q_d^2 + q_{d+16}^2 (and K alongside), then the
-            // butterfly 8,4,2,1 over d. Its result is one value every lane
-            // shares, (((t0+t4)+(t2+t6))+((t1+t5)+(t3+t7))) with t_c = s_c +
-            // s_{c+8}; stride 8 is the other lane half, 4,2,1 are in the lane.
-            // Each pair add is commutative bit for bit, so this is that value.
-            for (int i = 0; i < NR_AM; ++i) {
-                NR_FRAG_E4M3 vfr0, vfr1, qf0, qf1, kf0, kf1;
-                [[dont_flatten]] if (nr_tile_oob(mtok0 / 16u + uint(i))) {
-                    const f16vec2 zscale = f16vec2(NR_F16(wgt_f32[pc.s_off + h]), NR_F16(1.0));
-                    precise f16vec2 zs = f16vec2(0.0hf) * zscale;
-                    const fe4m3vec2 zq = nr_attn_quant(zs), zv = nr_attn_quant(f16vec2(0.0hf));
-                    for (int cc = 0; cc < 8; ++cc) {
-                        qf0[cc] = zq.x; qf1[cc] = zq.x; kf0[cc] = zq.y; kf1[cc] = zq.y;
-                        vfr0[cc] = zv.x; vfr1[cc] = zv.y;
-                    }
-                } else {
-                    for (int cc = 0; cc < 8; ++cc) {
-                        const fe4m3vec2 v = nr_attn_quant(f16vec2(qacc[i][4][cc], qacc[i][5][cc]));
-                        vfr0[cc] = v.x; vfr1[cc] = v.y;
-                    }
-                    f16vec2 qk0[8], qk1[8];
-                    precise f16vec2 t[8];
-                    for (int c = 0; c < 8; ++c) {
-                        qk0[c] = f16vec2(NR_F16(qacc[i][0][c]), NR_F16(qacc[i][2][c]));
-                        qk1[c] = f16vec2(NR_F16(qacc[i][1][c]), NR_F16(qacc[i][3][c]));
-                        precise f16vec2 sq0 = qk0[c] * qk0[c], sq1 = qk1[c] * qk1[c];
-                        precise f16vec2 sum = sq0 + sq1;
-                        t[c] = sum + unpackFloat2x16(subgroupShuffleXor(packFloat2x16(sum), 16u));
-                    }
-                    precise f16vec2 u0 = t[0] + t[4], u1 = t[1] + t[5], u2 = t[2] + t[6], u3 = t[3] + t[7];
-                    precise f16vec2 v0 = u0 + u2, v1 = u1 + u3;
-                    precise f16vec2 w = v0 + v1;
-                    const f16vec2 norm = f16vec2(
-                        NR_F16(inversesqrt(float(max(w.x, NR_F16(0.000062))))),
-                        NR_F16(inversesqrt(float(max(w.y, NR_F16(0.000062))))));
-                    const f16vec2 scale = f16vec2(NR_F16(wgt_f32[pc.s_off + h]), NR_F16(1.0));
-                    for (int c = 0; c < 8; ++c) {
-                        precise f16vec2 n0 = qk0[c] * norm, n1 = qk1[c] * norm;
-                        precise f16vec2 scaled0 = n0 * scale, scaled1 = n1 * scale;
-                        const fe4m3vec2 q0 = nr_attn_quant(scaled0), q1 = nr_attn_quant(scaled1);
-                        qf0[c] = q0.x; kf0[c] = q0.y; qf1[c] = q1.x; kf1[c] = q1.y;
-                    }
-                }
-                // Q/K: element (dim row, token column) at token*NR_QS + dim.
-                const uint tb = mtok0 + uint(i) * 16u;
-                NR_STORE_ACC_COL(qf0, lds_q, qb + tb * uint(NR_QS), uint(NR_QS));
-                NR_STORE_ACC_COL(qf1, lds_q, qb + tb * uint(NR_QS) + 16u, uint(NR_QS));
-                NR_STORE_ACC_COL(kf0, lds_k, qb + tb * uint(NR_QS), uint(NR_QS));
-                NR_STORE_ACC_COL(kf1, lds_k, qb + tb * uint(NR_QS) + 16u, uint(NR_QS));
-                NR_STORE_ACC_COL(vfr0, lds_v, vb + NR_VINDEX(tb, 0u), uint(NR_VS));
-                NR_STORE_ACC_COL(vfr1, lds_v, vb + NR_VINDEX(tb, 16u), uint(NR_VS));
-            }
+#if !NR_QKV_DONE
+#include "attn_qkv_epi.glsl"
+#endif
 #elif NR_USE_FUSED_QK_NORM
             // A lane owns dimensions d and d+16 of eight token rows, for Q
             // and K together. Match the old half tree: first combine the two

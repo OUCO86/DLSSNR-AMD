@@ -577,8 +577,8 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
     HostDevice host{};
     host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
     // A real queue and its real family. Construction submits the weight upload
-    // and waits for it, so the queue is held for the duration: the game is
-    // submitting to the same underlying VkQueue.
+    // and waits for it; the game is submitting to the same underlying VkQueue,
+    // so each of those submits takes the queue lock (below).
     host.queue = access.queue; host.queue_family = access.family;
     // Off the render thread. Building reads the weights, creates every pipeline
     // and allocates the arena, and doing that inside the upscaler's call froze
@@ -598,11 +598,17 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
         std::string error;
         bool oom = false;
         try {
-            // **Quiet**: this is not the render thread, and the flush half of
-            // the other lock drives DXVK's immediate context, which that thread
-            // owns. See QueueAccess::lock_quiet.
-            QueueAccess::HeldQuiet held(access_copy);
-            made = std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+            // The queue lock around each submit of the build, not around the
+            // build: held for the whole of it, the pipeline compile (7.75 s cold
+            // at 4K, S.T.A.L.K.E.R. 2) blocked vkd3d's own submissions and
+            // presents on the shared queue, and the game froze for as long
+            // (an 8.4 s frame). **Quiet**: this is not the render thread, and
+            // the flush half of the other lock drives DXVK's immediate context,
+            // which that thread owns. See QueueAccess::lock_quiet.
+            HostDevice locked = host;
+            locked.queue_lock = access_copy.lock_quiet;
+            locked.queue_unlock = access_copy.unlock_quiet;
+            made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
         } catch (const std::bad_alloc&) {
             // Caught apart from everything else because it is the one failure
             // that is about the *host* and is worth retrying. `what()` here is

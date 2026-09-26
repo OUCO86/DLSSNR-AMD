@@ -142,6 +142,25 @@ fe4m3vec2 nr_ffwd_quant(f16vec2 v) {
 }
 #endif
 #include "nr_prof.glsl"
+// NR_FFWD_GMAJOR: group-major workgroups. The NR_FFWD_WGW subgroups of a
+// workgroup share ONE weight group and take consecutive token tiles, so a
+// group's 64 KB of weights is fetched once into the CU's L0 for all of them
+// instead of once per subgroup from L2 (the group-per-subgroup form made every
+// subgroup of a workgroup read a different group). Same products, same k order
+// per output; subgroups past the last tile return (no barriers here).
+#ifndef NR_FFWD_GMAJOR
+#define NR_FFWD_GMAJOR 0
+#endif
+#if NR_FFWD_GMAJOR
+#define NR_FFWD_MAP(TT) \
+    uint group = gl_WorkGroupID.x % 8u, \
+         tok = ((gl_WorkGroupID.x / 8u) * NR_FFWD_WGW + NR_WAVE_OF(gl_LocalInvocationID.x)) * (TT); \
+    if (tok >= pc.M) return;
+#else
+#define NR_FFWD_MAP(TT) \
+    uint group = (gl_WorkGroupID.x % (8u / NR_FFWD_WGW)) * NR_FFWD_WGW + NR_WAVE_OF(gl_LocalInvocationID.x), \
+         tok = (gl_WorkGroupID.x / (8u / NR_FFWD_WGW)) * (TT);
+#endif
 // NR_FFWD_FM=2: one subgroup owns one group and TWO 16-token tiles, so every
 // weight fragment feeds two MMAs instead of one (the layer loads 64 KB of
 // weights a group and tile, and those loads' VGPR write-back costs SIMD
@@ -174,8 +193,7 @@ fe4m3vec2 nr_ffwd_quant(f16vec2 v) {
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
-    uint group = (gl_WorkGroupID.x % (8u / NR_FFWD_WGW)) * NR_FFWD_WGW + NR_WAVE_OF(gl_LocalInvocationID.x),
-         tok = (gl_WorkGroupID.x / (8u / NR_FFWD_WGW)) * 32u;
+    NR_FFWD_MAP(32u)
     const bool second = tok + 16u < pc.M;   // wave-uniform
     uint xbase = pc.x_off + (tok / 16u) * (pc.C / 16u) * 256u;
     uint agrp = pc.a_off + group * 64u * 512u, q0grp = pc.q0_off + group * 256u * 64u,
@@ -244,8 +262,7 @@ void main() {
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
-    uint group = (gl_WorkGroupID.x % (8u / NR_FFWD_WGW)) * NR_FFWD_WGW + NR_WAVE_OF(gl_LocalInvocationID.x),
-         tok = (gl_WorkGroupID.x / (8u / NR_FFWD_WGW)) * 16u;
+    NR_FFWD_MAP(16u)
     uint xbase = pc.x_off + (tok / 16u) * (pc.C / 16u) * 256u;
     uint agrp = pc.a_off + group * 64u * 512u, q0grp = pc.q0_off + group * 256u * 64u,
          q2grp = pc.q2_off + group * 64u * 256u;

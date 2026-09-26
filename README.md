@@ -51,7 +51,7 @@ three runs):
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
-| Linux | 6.00 ms | 10.41 ms | 22.87 ms |
+| Linux | 5.92 ms | 10.26 ms | 22.56 ms |
 | Windows | 9.4 ms | - | 33 ms |
 
 In game (Linux, RX 9070 XT):
@@ -101,12 +101,17 @@ None of these measurements use frame generation; the OptiScaler route can turn i
 32-bit games work on Linux (use the i686 package; not with `optiscaler`). The Windows version is
 64-bit only.
 
-## Why Vulkan and not HIP
+## Why Vulkan (and not HIP)
 
-- Game mods run inside the game's process, which on Linux is a Wine/Proton process. HIP/ROCm is not
-  available there; Vulkan is, because the game already draws through it (DXVK, vkd3d-proton).
-- The network runs on the game's own GPU device, so the frame is never copied to another API and back.
-- The same code runs on Linux and on Windows.
+HIP would work too: ROCm supports RDNA4 and its matrix (WMMA) instructions. Vulkan fits this job
+better:
+
+- The network runs on the game's own Vulkan device and queue (DXVK / vkd3d-proton under Proton). The
+  frame never leaves that device, and no second GPU context or cross-API synchronisation is needed.
+- Nothing extra to install: Vulkan comes with the graphics driver. HIP needs ROCm (Linux) or the HIP
+  SDK (Windows), plus a bridge to reach it from inside a Wine/Proton process.
+- RDNA4's matrix instructions are available in Vulkan through `VK_KHR_cooperative_matrix`, and one set
+  of shaders serves Linux and Windows.
 
 How the routes work in detail, and where the code is: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -120,7 +125,8 @@ bash install.sh "/path/to/steamapps/common/<game folder>" --dll /path/to/nvngx_d
 ```
 
 The folder is the one holding the game's exe. The installer lists the routes, extracts the model
-(below) and prints the Steam launch options to use. Needs `bash` and `python3`. See
+(below) and prints the Steam launch options to use. `--dll` is needed only for the first install:
+the extracted model is kept and reused for every later one. Needs `bash` and `python3`. See
 [linux/package/README.txt](linux/package/README.txt).
 
 ## The model
@@ -133,6 +139,9 @@ The weights are NVIDIA's and are not part of this project. They are extracted fr
 - A DLL of any other version is refused.
 - All 599 extracted entries are checked against known hashes; the model file is written only if every
   one matches. It takes about 20 seconds and needs `bash` and `python3`.
+- The extracted model is kept in the package's own `dlssnr-amd/dlssnr.bin`. Later installs from
+  that package without `--dll` check its SHA256 and install it from there, so the extraction runs
+  only once per package. With a new package, use `--dll` once more or copy that file over.
 
 Two ways to run it:
 

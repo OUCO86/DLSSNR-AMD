@@ -62,6 +62,11 @@
 // `ffwd3w` (ffwd3_t.comp NR_FFWD_FM=2: two 16-token tiles a subgroup, each weight
 // fragment feeding two MMAs) for C=512 layers of at least this many tokens; 0: never.
 // Fewer, heavier subgroups: 4K -14% a layer, 1080p +3%.
+// The subgroups of an ffwd3 workgroup share one weight group and take
+// consecutive token tiles (ffwd3_t.comp NR_FFWD_GMAJOR); must match the SPVs.
+#ifndef NR_FFWD_GMAJOR
+#define NR_FFWD_GMAJOR 0
+#endif
 #ifndef NR_FFWD_FM2_MIN_TOKENS
 #define NR_FFWD_FM2_MIN_TOKENS 0
 #endif
@@ -1464,6 +1469,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             {"gemm_projw_mt", uint32_t(NR_GEMM_PROJW_MT)},
             {"gemm_projw_nt", uint32_t(NR_GEMM_PROJW_NT)},
             {"ffwd_wgw", uint32_t(NR_FFWD_WGW)},
+            {"ffwd_gmajor", uint32_t(NR_FFWD_GMAJOR)},
             {"ffwd_fm2_min", uint32_t(NR_FFWD_FM2_MIN_TOKENS)},
             {"post_alpha", uint32_t(NR_POST_ALPHA)},
             {"upsview_vec", uint32_t(NR_UPSVIEW_VEC)},
@@ -1522,6 +1528,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (!built.count("noise_field")) built["noise_field"] = 0;
         if (!built.count("ffwd_fm2_min")) built["ffwd_fm2_min"] = 0;
         if (!built.count("post_alpha")) built["post_alpha"] = 0;
+        if (!built.count("ffwd_gmajor")) built["ffwd_gmajor"] = 0;
         for (const auto& [name, mine] : want) {
             auto it = built.find(name);
             if (it == built.end()) {
@@ -2663,7 +2670,16 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             p.M = vt; p.C = 512u;
             const bool fm2 = NR_FFWD_FM2_MIN_TOKENS != 0 && vt >= uint32_t(NR_FFWD_FM2_MIN_TOKENS);
             d.kern = fm2 ? "ffwd3w" : "ffwd3";
+#if NR_FFWD_GMAJOR
+            // Group-major workgroups (ffwd3_t.comp NR_FFWD_GMAJOR): eight groups
+            // times the token units split NR_FFWD_WGW a workgroup, the last one partial.
+            {
+                const uint32_t units = (vt / 16u + (fm2 ? 1u : 0u)) / (fm2 ? 2u : 1u);
+                d.gx = 8u * ((units + uint32_t(NR_FFWD_WGW) - 1u) / uint32_t(NR_FFWD_WGW));
+            }
+#else
             d.gx = (vt / 16u + (fm2 ? 1u : 0u)) / (fm2 ? 2u : 1u) * (8u / uint32_t(NR_FFWD_WGW));
+#endif
             d.gy = 1; d.gz = 1;
             d.push.resize(sizeof p);
             std::memcpy(d.push.data(), &p, sizeof p);

@@ -2,6 +2,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -60,6 +61,9 @@ struct HostDevice {
     // queries through their next instance dispatch, not the outer loader.
     // Null for ordinary application-owned (outer-loader) handles.
     PFN_vkGetInstanceProcAddr physical_dispatch{};
+    // The host API's queue lock, taken by the constructor around each of its
+    // submits only. Empty: the caller serialises the whole construction.
+    std::function<void()> queue_lock, queue_unlock;
 };
 
 struct RuntimeConfig {

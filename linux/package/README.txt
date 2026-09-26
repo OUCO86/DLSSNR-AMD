@@ -46,6 +46,10 @@ own copy of nvngx_dlssnr.dll, and it must be version 310.8.0:
 
 The result is dlssnr-amd/dlssnr.bin in the game folder (147,756,560 bytes).
 
+This is needed only once: the extracted model is also kept in this package's
+dlssnr-amd/dlssnr.bin, and later installs from this package without --dll check its SHA256 and
+install it from there. With a new package, use --dll once more, or copy that file over.
+
 To make the model file without installing anything:
 
     bash model-tools/extract_model.sh /path/to/nvngx_dlssnr_310.8.0.zip dlssnr.bin
