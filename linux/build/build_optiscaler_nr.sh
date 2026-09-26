@@ -57,6 +57,7 @@ source linux/build/arch/rdna4.sh
 "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_model.cpp -o "$out/model.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_dlssnr_forwarder.cpp -o "$out/forwarder.o"
 "$cxx" "${common[@]}" -c linux/src/pe/nr_ngx_core.cpp -o "$out/ngx_core.o"
+"$cxx" "${common[@]}" -c linux/src/pe/nr_pe_optifix.cpp -o "$out/optifix.o"
 
 # MinHook, for the device watcher the Vulkan path asks for a queue through.
 for unit in hook buffer trampoline; do
@@ -74,10 +75,10 @@ ldflags=(-ld3d12 -ldxgi -lole32 -static -static-libgcc -static-libstdc++)
 shared_objs=("$out/model.o" "$out/session.o" "$out/interop.o" "$out/log.o" "$out/vkdevice.o"
              "$out/nr_runtime.o" "$out/nr_native_plan.o" "$out"/mh_*.o)
 forwarder_objs=("$out/forwarder.o" "${shared_objs[@]}")
-core_objs=("$out/ngx_core.o" "${shared_objs[@]}")
+core_objs=("$out/ngx_core.o" "$out/optifix.o" "${shared_objs[@]}")
 # Both links contribute undefined vk* names; the probe link takes every object either DLL uses so one
 # generated thunk file serves both.
-undefined=$({ "$cxx" -shared -o /dev/null "${forwarder_objs[@]}" "$out/ngx_core.o" "${ldflags[@]}" 2>&1 || true; } |
+undefined=$({ "$cxx" -shared -o /dev/null "${forwarder_objs[@]}" "$out/ngx_core.o" "$out/optifix.o" "${ldflags[@]}" 2>&1 || true; } |
     grep -o "undefined reference to \`_*vk[A-Za-z0-9_@]*'" | sed "s/.*\`//; s/'//" | sort -u)
 count=$(echo "$undefined" | grep -c . || true)
 plain() { echo "$1" | sed 's/^_//; s/@[0-9]*$//'; }

@@ -191,7 +191,11 @@ JSON
 sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/ReShadePreset.ini" > "$vk/ReShadePreset-d3d9.ini"
 
 # optiscaler/ (x86_64 only): the OptiScaler-NR release zip, unmodified, plus our
-# _nvngx.dll (answers NGX CreateFeature 18) and the forwarder pair.
+# NGX core (answers NGX CreateFeature 18) and the forwarder pair. The core ships as
+# dlssnr_core.dll, not under NVIDIA's name _nvngx.dll: a module of that name already in
+# the process is taken by Streamline for NVIDIA's own core, and ours offers no DLSS, so
+# Streamline games (007 First Light) lost the DLSS option; renamed, it is selectable again. OptiScaler finds it through
+# [Libraries] NvngxPath, which takes a file path.
 if [[ "$arch" == x86_64 ]]; then
     opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip}
     [[ -f "$opti_zip" ]] || { echo "missing $opti_zip" >&2; exit 1; }
@@ -199,7 +203,8 @@ if [[ "$arch" == x86_64 ]]; then
     mkdir -p -- "$pkg/optiscaler"
     cp -- "$opti_zip" "$pkg/optiscaler/"
     cp -- artifacts/optiscaler/nr/nvngx.dll_dlssnr.dll artifacts/optiscaler/nr/nvngx_dlssnr.dll \
-          artifacts/optiscaler/nr/_nvngx.dll "$pkg/optiscaler/"
+          "$pkg/optiscaler/"
+    cp -- artifacts/optiscaler/nr/_nvngx.dll "$pkg/optiscaler/dlssnr_core.dll"
     cp -- linux/package/optiscaler/extract_release.py linux/package/optiscaler/patch_ini.py "$pkg/optiscaler/"
 fi
 

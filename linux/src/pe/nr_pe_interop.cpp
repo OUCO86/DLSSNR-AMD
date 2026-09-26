@@ -64,6 +64,38 @@ bool is_typeless(DXGI_FORMAT format) {
     default: return false;
     }
 }
+
+// The VkFormat vkd3d-proton gives a depth/stencil resource (libs/vkd3d/utils.c, vkd3d_get_format and
+// the depth-stencil table): a two-plane format - or a typeless or view format of one - is always its
+// depth/stencil VkFormat, with or without ALLOW_DEPTH_STENCIL; a one-plane format only with it. D24S8
+// becomes D32S8 where the device cannot render D24S8, which is every AMD GPU ("AMD doesn't support
+// VK_FORMAT_D24_UNORM_S8_UINT"); asked the same way vkd3d asks. UNDEFINED for everything else.
+VkFormat depth_stencil_format(ID3D12DXVKInteropDevice* interop, const D3D12_RESOURCE_DESC& desc) {
+    const bool ds = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    switch (desc.Format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: {
+        VkInstance instance = VK_NULL_HANDLE;
+        VkPhysicalDevice physical = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
+        interop->GetVulkanHandles(&instance, &physical, &device);
+        if (!physical) return VK_FORMAT_UNDEFINED;
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+                   ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT:
+        return ds ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM:
+        return ds ? VK_FORMAT_D16_UNORM : VK_FORMAT_UNDEFINED;
+    default:
+        return VK_FORMAT_UNDEFINED;
+    }
+}
 }  // namespace
 
 VkFormat vulkan_format_of(DXGI_FORMAT format) { return vulkan_format(format); }
@@ -111,6 +143,14 @@ ResourceHandle resource_handle(ID3D12Device* device, ID3D12Resource* resource,
         out.height = uint32_t(desc.Height);
         out.dxgi = desc.Format;
         out.format = vulkan_format(desc.Format);
+        // A depth buffer is read through its depth aspect (nr_runtime.cpp, runtime_depth.comp).
+        if (const VkFormat depth = depth_stencil_format(interop, desc); depth != VK_FORMAT_UNDEFINED)
+            out.format = depth;
+        // vkd3d-proton gives every image transfer usage, SAMPLED unless the
+        // resource denies shader resources, STORAGE with unordered access.
+        out.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) out.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) out.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         // Kept even when the format is unknown: the handle carries what the
         // format *was*, and that is the one thing a rejection has to report.
     }

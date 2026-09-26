@@ -1156,7 +1156,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 #ifndef NR_BUILD_STAMP
 #define NR_BUILD_STAMP "unstamped"
 #endif
-        nr::pe::log("[nr] _nvngx.dll attached (build %s, %s %s), log %s", NR_BUILD_STAMP,
+        // Under its own file name: the packages ship it as dlssnr_core.dll (never NVIDIA's _nvngx.dll).
+        char path[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
+        const char* name = n ? path : "NGX core";
+        for (const char* c = path; n && *c; ++c)
+            if (*c == '\\' || *c == '/') name = c + 1;
+        nr::pe::log("[nr] %s attached (build %s, %s %s), log %s", name, NR_BUILD_STAMP,
                     __DATE__, __TIME__, nr::pe::log_path());
     }
     return TRUE;

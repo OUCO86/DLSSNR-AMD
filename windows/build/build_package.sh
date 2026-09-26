@@ -180,7 +180,10 @@ python3 linux/package/optiscaler/extract_release.py "$opti_zip" "$op/game" > /de
 ( cd "$op/game" && rm -rf -- '!! EXTRACT ALL FILES TO GAME FOLDER !!' setup_windows.bat setup_linux.sh \
       nvngx.dll_dlssnr.dll images tests docs README.md CONTRIBUTING.md Features.md Spoofing.md Config.md \
       INSTALL-DLSSNR.md SHA256SUMS.txt )
-cp -- artifacts/windows/optiscaler/{_nvngx.dll,nvngx.dll_dlssnr.dll,nvngx_dlssnr.dll,dxgi-original.dll} "$op/"
+# Our NGX core ships as dlssnr_core.dll, not under NVIDIA's name: a loaded _nvngx.dll is taken by
+# Streamline for NVIDIA's own core, and ours offers no DLSS (linux/build/build_package.sh).
+cp -- artifacts/windows/optiscaler/{nvngx.dll_dlssnr.dll,nvngx_dlssnr.dll,dxgi-original.dll} "$op/"
+cp -- artifacts/windows/optiscaler/_nvngx.dll "$op/dlssnr_core.dll"
 
 cp -- windows/package/install.bat windows/package/README.txt "$pkg/"
 # Windows PowerShell 5.1 reads a script without a byte-order mark in the ANSI code page.

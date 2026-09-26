@@ -763,6 +763,7 @@ bool fill(ColourFrame* out, const ResourceHandle& handle) {
     out->format = handle.format;
     out->width = handle.width; out->height = handle.height;
     out->before = out->after = handle.layout;
+    out->usage = handle.usage;
     return true;
 }
 
@@ -793,6 +794,9 @@ void apply_guide_subrect(ColourFrame* guide, const Session::Subrect& want, const
         }
         return;
     }
+    // A narrowed guide is no longer the whole image: the runtime must read it
+    // through its blit, not sample the allocation in place.
+    if ((want.width && want.width < guide->width) || (want.height && want.height < guide->height)) guide->usage = 0;
     if (want.width && want.width <= guide->width) guide->width = want.width;
     if (want.height && want.height <= guide->height) guide->height = want.height;
 }
@@ -1032,6 +1036,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     frame.format = target.format;
     frame.width = target.width; frame.height = target.height;
     frame.before = frame.after = target.layout;
+    frame.usage = target.usage;
 
     EngineFrame engine{};
     engine.colour = frame;

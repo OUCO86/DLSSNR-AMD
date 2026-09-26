@@ -54,10 +54,26 @@
 #ifndef NR_FFWD_WGW
 #define NR_FFWD_WGW 8
 #endif
+// The post block can restore the frame's alpha itself (fswin_t.comp NR_POST_ALPHA;
+// manifest post_alpha), which the runtime uses instead of its alpha pass.
+#ifndef NR_POST_ALPHA
+#define NR_POST_ALPHA 0
+#endif
+// `ffwd3w` (ffwd3_t.comp NR_FFWD_FM=2: two 16-token tiles a subgroup, each weight
+// fragment feeding two MMAs) for C=512 layers of at least this many tokens; 0: never.
+// Fewer, heavier subgroups: 4K -14% a layer, 1080p +3%.
+#ifndef NR_FFWD_FM2_MIN_TOKENS
+#define NR_FFWD_FM2_MIN_TOKENS 0
+#endif
 
 // upsview/repack move a token's 16-channel run per invocation.
 #ifndef NR_UPSVIEW_VEC
 #define NR_UPSVIEW_VEC 0
+#endif
+// The upsample view as the producer's own store when the view is a copy (see
+// the F_UPS lowering).
+#ifndef NR_UPSVIEW_FOLD
+#define NR_UPSVIEW_FOLD 1
 #endif
 #ifndef NR_REPACK_VEC
 #define NR_REPACK_VEC 0
@@ -65,6 +81,35 @@
 // Which wide widths use the fused upsample body (bit 1 C64, 2 C128, 4 C256).
 #ifndef NR_WIDE_UPS_MASK
 #define NR_WIDE_UPS_MASK 7
+#endif
+// Straggler-queue threshold in percent of a layer's queued items (0: off). Must
+// match the shaders' `persist_strag` constant. NR_STRAG_PCT_ENV overrides it for
+// experiments only.
+#ifndef NR_STRAG_PCT
+#define NR_STRAG_PCT 0
+#endif
+// One workgroup per item for the folded runs of 65..NR_PERSIST_ONE_MAX windows a
+// layer, per width (bits as persist_ds: 2 C=128, 4 C=256); those widths'
+// fswinpds/fswinpup SPVs must be built with NR_PERSIST_ONE=1. Must match the
+// shaders' `persist_one` constant.
+#ifndef NR_PERSIST_ONE_MASK
+#define NR_PERSIST_ONE_MASK 0
+#endif
+#ifndef NR_PERSIST_ONE_MAX
+#define NR_PERSIST_ONE_MAX 400
+#endif
+// The pre-block's noise features precomputed once at build into the weight arena
+// (noise_field.comp); fswinimagepreds32 must be built with NR_NOISE_FIELD=1. Must
+// match the shaders' `noise_field` constant.
+#ifndef NR_NOISE_FIELD
+#define NR_NOISE_FIELD 0
+#endif
+struct NoiseJob { uint32_t off, width, height, seed; float noise; };
+static std::vector<NoiseJob> g_noise_jobs;
+// Fold the ViT token-order repacks into FinalHead's and the last ViT
+// projection's stores (gemm1x1 NR_OUT_PERM); 0 keeps the repack dispatches.
+#ifndef NR_REPACK_FOLD
+#define NR_REPACK_FOLD 0
 #endif
 // decups channels per invocation (1 = the original per-element grid).
 #ifndef NR_DECUPS_VEC
@@ -131,6 +176,14 @@ const char* arg(int c, char** v, const char* k, const char* d = nullptr) {
 }
 bool flag(int c, char** v, const char* k) {
     for (int i = 1; i < c; ++i) if (!std::strcmp(v[i], k)) return true;
+    return false;
+}
+// The per-layer and scoring tools read values by slot after the frame; they
+// keep the one-value-one-slot layout (no arena reuse) and the plain repacks.
+bool slot_reading_diagnostic(int c, char** v) {
+    for (const char* f : {"--only", "--seed-dir", "--oracle", "--hash-values", "--dump", "--dump-stage",
+                          "--seed", "--score", "--ds-only", "--barrier-report", "--dump-layer"})
+        if (flag(c, v, f) || arg(c, v, f)) return true;
     return false;
 }
 
@@ -682,8 +735,9 @@ static_assert(sizeof(PushFSwin)+sizeof(PushUps)+sizeof(PushImageTail)==128);
 struct PushPreImage {
     uint32_t lift,source_W,source_H,seed;
     float style,tone,structure,skin,other,noise,constant;
+    uint32_t noise_off;   // NR_NOISE_FIELD: u32 index of the precomputed noise features, 0: none
 };
-static_assert(sizeof(PushPreImage)==44 && sizeof(PushFSwin)+sizeof(PushPreImage)==124);
+static_assert(sizeof(PushPreImage)==48 && sizeof(PushFSwin)+sizeof(PushPreImage)==128);
 struct PushAttn  {
     uint32_t x_off, o_off, w_off, b_off, s_off, C, wins_x, tiles_x, tiles_y;
     int32_t shift, shift_y;
@@ -1288,9 +1342,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // Off for the per-layer and scoring tools, which read values by slot after
     // the frame.
     bool reuse = flag(argc, argv, "--reuse") && !flag(argc, argv, "--no-reuse") && !arena_probe;
-    for (const char* f : {"--only", "--seed-dir", "--oracle", "--hash-values", "--dump", "--dump-stage",
-                          "--seed", "--score", "--ds-only", "--barrier-report", "--dump-layer"})
-        if (flag(argc, argv, f) || arg(argc, argv, f)) reuse = false;
+    if (slot_reading_diagnostic(argc, argv)) reuse = false;
     size_t plain_total = 0;
     for (const auto& kv : vsize) if (kv.second) plain_total += align(kv.second, 256);
     if (reuse) {
@@ -1402,6 +1454,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // has to know. Add one here the moment the host reads a shader's shape.
         const std::pair<const char*, uint32_t> want[] = {
             {"vattn_qt", vattn_qt},
+            {"persist_strag", uint32_t(NR_STRAG_PCT)},
+            {"persist_one", uint32_t(NR_PERSIST_ONE_MASK)},
+            {"noise_field", uint32_t(NR_NOISE_FIELD)},
             {"gemm_wide_mt", uint32_t(NR_GEMM_WIDE_MT)},
             {"gemm_wide_nt", uint32_t(NR_GEMM_WIDE_NT)},
             {"gemm_proj_mt", uint32_t(NR_GEMM_PROJ_MT)},
@@ -1409,6 +1464,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             {"gemm_projw_mt", uint32_t(NR_GEMM_PROJW_MT)},
             {"gemm_projw_nt", uint32_t(NR_GEMM_PROJW_NT)},
             {"ffwd_wgw", uint32_t(NR_FFWD_WGW)},
+            {"ffwd_fm2_min", uint32_t(NR_FFWD_FM2_MIN_TOKENS)},
+            {"post_alpha", uint32_t(NR_POST_ALPHA)},
             {"upsview_vec", uint32_t(NR_UPSVIEW_VEC)},
             {"repack_vec", uint32_t(NR_REPACK_VEC)},
             {"wide_ups_mask", uint32_t(NR_WIDE_UPS_MASK)},
@@ -1459,6 +1516,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (weight_layout != 0 && accumulation != "fp32") {
             std::fprintf(stderr,"packed shader weights require fp32 accumulation\n"); return 1;
         }
+        // Shader directories from before the straggler queue record no key: off.
+        if (!built.count("persist_strag")) built["persist_strag"] = 0;
+        if (!built.count("persist_one")) built["persist_one"] = 0;
+        if (!built.count("noise_field")) built["noise_field"] = 0;
+        if (!built.count("ffwd_fm2_min")) built["ffwd_fm2_min"] = 0;
+        if (!built.count("post_alpha")) built["post_alpha"] = 0;
         for (const auto& [name, mine] : want) {
             auto it = built.find(name);
             if (it == built.end()) {
@@ -1486,6 +1549,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     // so a log that stops between them says which of the two it was.
     nr::logf("unpacking weights from %s", unp.c_str());
     std::vector<uint8_t> wblob;
+    g_noise_jobs.clear();   // this lowering's own; the arena probe ran its own before
     auto put = [&](const std::vector<uint8_t>& v, size_t a) {
         wblob.resize(align(wblob.size(), a));
         const size_t off = wblob.size();
@@ -1832,8 +1896,17 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                             +4u*((ch/8u)%2u)+(k%2u)+2u*(k/8u);
                         std::memcpy(plain_lift.data()+2*(ch*16u+k),packed_lift.data()+2*off,2);
                     }
+                    uint32_t noise_off=0;
+                    if (NR_NOISE_FIELD) {
+                        // A zeroed region the build fills on the GPU after the upload
+                        // (see g_noise_jobs); f16 x4 per pixel of the working grid.
+                        const uint32_t nw=d.gx*8u, nh=d.gy*8u;
+                        noise_off=uint32_t(put(std::vector<uint8_t>(size_t(nw)*nh*8u,0),256)/4);
+                        if(!noise_off)throw std::runtime_error("noise field at offset 0");
+                        g_noise_jobs.push_back({noise_off,nw,nh,pi.seed,pi.noise});
+                    }
                     const PushPreImage ip{uint32_t(put(plain_lift,16)/2),pi.source_W,pi.source_H,
-                        pi.seed,pi.s434,pi.aux0,pi.aux1,pi.gate0,pi.gate1,pi.noise,pi.konst};
+                        pi.seed,pi.s434,pi.aux0,pi.aux1,pi.gate0,pi.gate1,pi.noise,pi.konst,noise_off};
                     d.kern="fswinimagepreds32";d.push.resize(sizeof(PushFSwin)+sizeof ip);
                     std::memcpy(d.push.data()+sizeof(PushFSwin),&ip,sizeof ip);
                 } else disp.push_back(std::move(di));   // the lift, first
@@ -2009,11 +2082,48 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                                    uint32_t(voff[ups_key(s.block)]),
                                    uint32_t(s.tokens), uint32_t(2 * C),
                                    uint32_t(s.H), uint32_t(s.W)};
+                    // **When the view is a copy, the producer writes it.** With
+                    // W and H multiples of four the padded raster is the raster
+                    // (rw*rh == W*H), so every destination token below H rows is
+                    // the source token of the same index and channel, and the
+                    // rest - the window padding past the source's tokens - is
+                    // zero. The layer before then stores straight into the view
+                    // slot, whose tail stays the zero it was allocated as: it is
+                    // pinned for the frame (overread), so no other value shares
+                    // those bytes. 1080p and 4K both take this; other extents
+                    // keep the adapter.
+                    int producer = -1;
+                    if (NR_UPSVIEW_FOLD && pv.W % 4u == 0u && pv.H % 4u == 0u && pv.M >= pv.W * pv.H &&
+                        !flag(argc, argv, "--no-upsview-fold") && !slot_reading_diagnostic(argc, argv)) {
+                        for (int k = int(disp.size()) - 1; k >= 0 && producer < 0; --k) {
+                            const Disp& q = disp[size_t(k)];
+                            if (q.kern == "gemmproj" && q.push.size() == sizeof(PushGemm)) {
+                                PushGemm g; std::memcpy(&g, q.push.data(), sizeof g);
+                                if (g.o_off == pv.x_off && g.M == pv.W * pv.H) producer = k;
+                            } else if (q.kern == "fswin" + std::to_string(2 * C) && q.push.size() == sizeof(PushFSwin)) {
+                                PushFSwin f; std::memcpy(&f, q.push.data(), sizeof f);
+                                if (f.o_off == pv.x_off) producer = k;
+                            }
+                        }
+                    }
+                    if (producer >= 0) {
+                        Disp& q = disp[size_t(producer)];
+                        if (q.kern == "gemmproj") {
+                            PushGemm g; std::memcpy(&g, q.push.data(), sizeof g);
+                            g.o_off = pv.o_off; std::memcpy(q.push.data(), &g, sizeof g);
+                        } else {
+                            PushFSwin f; std::memcpy(&f, q.push.data(), sizeof f);
+                            f.o_off = pv.o_off; std::memcpy(q.push.data(), &f, sizeof f);
+                        }
+                        const int vk = ups_key(s.block);
+                        overread[vk] = std::max(overread[vk], std::max(vsize[vk], size_t(pv.M) * pv.C));
+                    } else {
                     dv.kern = "upsview";
                     dv.gx = (pv.M * (NR_UPSVIEW_VEC ? pv.C / 16u : pv.C) + 63u) / 64u; dv.gy = dv.gz = 1;
                     dv.push.resize(sizeof pv);
                     std::memcpy(dv.push.data(), &pv, sizeof pv);
                     disp.push_back(std::move(dv));
+                    }
                 }
                 // **The prologue goes first**, which is the whole difference
                 // from `_ds`: project, replicate, blend the skip, then the body.
@@ -2551,8 +2661,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 ? uint32_t(s.tokens)
                 : tiles_of(s.H) * tiles_of(s.W) * 16u;
             p.M = vt; p.C = 512u;
-            d.kern = "ffwd3";
-            d.gx = vt / 16u * (8u / uint32_t(NR_FFWD_WGW)); d.gy = 1; d.gz = 1;
+            const bool fm2 = NR_FFWD_FM2_MIN_TOKENS != 0 && vt >= uint32_t(NR_FFWD_FM2_MIN_TOKENS);
+            d.kern = fm2 ? "ffwd3w" : "ffwd3";
+            d.gx = (vt / 16u + (fm2 ? 1u : 0u)) / (fm2 ? 2u : 1u) * (8u / uint32_t(NR_FFWD_WGW));
+            d.gy = 1; d.gz = 1;
             d.push.resize(sizeof p);
             std::memcpy(d.push.data(), &p, sizeof p);
         } else if (sh.fam == F_ATTN) {
@@ -2600,7 +2712,34 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             d.push.resize(sizeof p);
             std::memcpy(d.push.data(), &p, sizeof p);
         } else {
-            if (host_boundary && s.block == 31 && s.layer == 0) {
+            // NR_REPACK_FOLD: FinalHead (gemmnores, NR_OUT_PERM=2) writes the
+            // raster copy itself; the repack below only runs when it cannot.
+            bool in_folded = false;
+            if (NR_REPACK_FOLD && host_boundary && s.block == 31 && s.layer == 0 &&
+                s.W % 4 == 0 && s.H % 4 == 0 && !flag(argc, argv, "--no-repack-fold") &&
+            !slot_reading_diagnostic(argc, argv)) {
+                for (auto it = disp.rbegin(); it != disp.rend(); ++it)
+                    if (it->s->block == 30 && it->s->layer == 4 && it->kern == "gemmnores") {
+                        PushGemm q{};
+                        std::memcpy(&q, it->push.data(), sizeof q);
+                        // The slot is written by FinalHead now, so its lifetime
+                        // starts at FinalHead's step: record the access there,
+                        // or the shared arena may overlap it with FinalHead's
+                        // own live output.
+                        const int lowering_now = voff.step;
+                        for (size_t i = 0; i < run.size(); ++i)
+                            if (run[i] == it->s) voff.step = int(i);
+                        q.p_off = uint32_t(voff[lift_key(31)]);
+                        voff.step = lowering_now;
+                        // PushRepack's W/H are passed as s.H/s.W: the repack's raster
+                        // is s.H wide and s.W tall, so the fold uses the same.
+                        q.W = uint32_t(s.H); q.rows = uint32_t(s.W);
+                        std::memcpy(it->push.data(), &q, sizeof q);
+                        in_folded = true;
+                        break;
+                    }
+            }
+            if (host_boundary && s.block == 31 && s.layer == 0 && !in_folded) {
                 Disp rep{&s};
                 PushRepack p{uint32_t(voff[blk_out(30)]), uint32_t(voff[lift_key(31)]),
                              uint32_t(s.H), uint32_t(s.W), 1024, 0};
@@ -2777,8 +2916,22 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             disp.push_back(std::move(norm));
             continue;
         }
+        // NR_REPACK_FOLD: the last ViT projection stores at the tile
+        // positions the inverse repack would move its raster tokens to.
+        bool out_folded = false;
+        if (NR_REPACK_FOLD && host_boundary && s.block == 38 && s.layer == 4 && d.kern == "gemmproj" &&
+            s.W % 4 == 0 && s.H % 4 == 0 && !flag(argc, argv, "--no-repack-fold") &&
+            !slot_reading_diagnostic(argc, argv)) {
+            PushGemm q{};
+            std::memcpy(&q, d.push.data(), sizeof q);
+            q.o_off = uint32_t(voff[ups_key(38)]);
+            q.W = uint32_t(s.H); q.rows = uint32_t(s.W);   // as the repack (see b031l0)
+            std::memcpy(d.push.data(), &q, sizeof q);
+            d.kern = "gemmprojt";
+            out_folded = true;
+        }
         disp.push_back(std::move(d));
-        if (host_boundary && s.block == 38 && s.layer == 4) {
+        if (host_boundary && s.block == 38 && s.layer == 4 && !out_folded) {
             Disp rep{&s};
             PushRepack p{uint32_t(voff[key_of(38,4)]), uint32_t(voff[ups_key(38)]),
                          uint32_t(s.H), uint32_t(s.W), 1024, 1};
@@ -2818,7 +2971,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         // Layout 2 extends layout 1 with the three grouped FFWD matrices.
         const bool pack_ffwd = weight_layout >= 2;
         for(const auto& pd:disp) {
-            if(pack_ffwd && pd.kern=="ffwd3") {
+            if(pack_ffwd && (pd.kern=="ffwd3" || pd.kern=="ffwd3w")) {
                 PushFfwd3 p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed FFWD push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
@@ -2827,7 +2980,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J);
                 continue;
             }
-            if(pd.kern=="gemmproj" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm") {
+            if(pd.kern=="gemmproj" || pd.kern=="gemmprojt" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm") {
                 PushGemm p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed GEMM push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
@@ -2928,6 +3081,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             }
         }
         const uint32_t wg_override = uint32_t(std::atoi(arg(argc, argv, "--persist-wg", "0")));
+        const double strag_pct = std::getenv("NR_STRAG_PCT_ENV") ? std::atof(std::getenv("NR_STRAG_PCT_ENV"))
+                                                                 : double(NR_STRAG_PCT);
         // Enough polls that a producer's whole dispatch fits inside one, and
         // few enough that a wiring bug returns rather than hangs the device.
         const uint32_t spin_limit = uint32_t(std::atoi(arg(argc, argv, "--persist-spin", "4194304")));
@@ -2967,9 +3122,15 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     // at 1080p C=256 that is 135 windows on 128 slots; at 4K the
                     // grid is several rounds deep and the fold only adds a chain
                     // item (measured +0.015 ms at 4K, -0.02..-0.03 at 1080p).
-                    disp[j + 1].gx * disp[j + 1].gy <= 2u * std::min<uint32_t>(
-                        C == 64 ? 512u : C == 128 ? 256u : 128u,
-                        wg_override ? wg_override : 0xFFFFFFFFu);
+                    // C=64 and C=128 always (the fold's own layer beats the
+                    // standalone dispatch's ramp and tail at every extent measured:
+                    // 1080p -17 us, 4K -25 us over the four); C=256 only where the
+                    // standalone DS grid ends in a partial round: at 1080p that is
+                    // 135 windows on 128 slots; at 4K the grid is several rounds
+                    // deep and the fold only adds a chain item (+0.015 ms at 4K,
+                    // -0.02..-0.03 at 1080p).
+                    (C < 256 || disp[j + 1].gx * disp[j + 1].gy <= 2u * std::min<uint32_t>(
+                        128u, wg_override ? wg_override : 0xFFFFFFFFu));
                 if (ds_fold) ++j;
                 // And the wide fused upsample just before it, as layer 0.
                 const bool up_fold = !ds_fold && NR_PERSIST_DF && (uint32_t(NR_PERSIST_UPS_MASK) & ds_bit) &&
@@ -2978,9 +3139,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     fp(out.back()).tiles_x == fp(disp[i]).tiles_x &&
                     fp(out.back()).tiles_y == fp(disp[i]).tiles_y &&
                     fp(out.back()).o_off == fp(disp[i]).x_off &&
-                    out.back().gx * out.back().gy <= 2u * std::min<uint32_t>(
-                        C == 64 ? 512u : C == 128 ? 256u : 128u,
-                        wg_override ? wg_override : 0xFFFFFFFFu);
+                    (C < 256 || out.back().gx * out.back().gy <= 2u * std::min<uint32_t>(
+                        128u, wg_override ? wg_override : 0xFFFFFFFFu));
                 Disp up_disp{disp[i].s};
                 if (up_fold) { up_disp = std::move(out.back()); out.pop_back(); }
                 std::vector<const Disp*> lay;
@@ -3013,7 +3173,29 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 uint32_t wgo = wg_override;
                 // Diagnostic: per-width override NR_PERSIST_WG_<C>.
                 if (const char* e = std::getenv(("NR_PERSIST_WG_" + std::to_string(C)).c_str())) wgo = uint32_t(std::atoi(e));
-                const uint32_t wg = std::min(most, wgo ? wgo : cap);
+                // C=64 runs of up to 4096 windows a layer take 384 workgroups, six
+                // a CU instead of eight: fewer starved young ones (1080p -5 us a
+                // run; at 4K, 8 of them a CU are faster by 10).
+                if (!wgo && C == 64 && most <= 4096u) wgo = 384u;
+                uint32_t wg = std::min(most, wgo ? wgo : cap);
+                // One workgroup per item: a persistent workgroup keeps its launch
+                // age for the whole run, and oldest-first wave arbitration runs the
+                // youngest on a CU several times slower - whatever it claims, often
+                // an item on the run's critical chain. Launched one per item, age
+                // follows claim order instead. Pays where a layer has more windows
+                // than CUs but not many more: C=256 at 1080p (144 windows) -20..-35
+                // us a run, 1280x720 (77) -7, 1440p (252) tie, 60 and below +55
+                // (the per-item launch); C=128 at 960x540 (160) -16, 1280x720 (286)
+                // -22, 1440x810 (336) -20, 1707x960 (448) and 1080p (558) tie, 4K
+                // (2135) +20.
+                const bool one = (uint32_t(NR_PERSIST_ONE_MASK) & ds_bit) && (ds_fold || up_fold) &&
+                                 most > 64u && most <= uint32_t(NR_PERSIST_ONE_MAX) && !wgo;
+                if (one) wg = windows;
+                // Launched one per item there are no old workgroups for the straggler
+                // queue to prefer: a pipeline that has one (blocking, NR_STRAG=2) gets
+                // a threshold of 100% - nothing is routed to it and its claims are the
+                // plain queue's.
+                const double run_strag = one && strag_pct > 0 ? 100.0 : strag_pct;
                 PushPersist pp{};
                 pp.layers_off = uint32_t(put(recs, 16) / 4);
                 if (ds_fold) {
@@ -3062,6 +3244,32 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     std::vector<uint32_t> tab(need);
                     tab.insert(tab.end(), cons.begin(), cons.end());
                     tab.insert(tab.end(), init.begin(), init.end());
+                    // Straggler queue tables (pipelines built with NR_STRAG): item -> layer
+                    // at 6*TW; (queued items, threshold) per layer at 7*TW; then the two
+                    // queues' per-frame totals. An item whose ready-rank in its layer is at
+                    // or above the threshold is claimed by the oldest workgroups of a CU,
+                    // which oldest-first wave arbitration runs fastest - such items end
+                    // their layer late and form the run's critical chain.
+                    if (run_strag > 0) {
+                        const double f = run_strag / 100.0;
+                        tab.resize(size_t(6) * windows, 0u);
+                        std::vector<uint32_t> lay(windows, 0u), q(16, 0u);
+                        if (n > 16) throw std::runtime_error("straggler queue: more than 16 layers");
+                        for (uint32_t k = 0; k < n; ++k)
+                            for (uint32_t w = 0; w < rec[k].windows; ++w) {
+                                lay[rec[k].flag_base + w] = k;
+                                if (need[rec[k].flag_base + w]) ++q[k];
+                            }
+                        tab.insert(tab.end(), lay.begin(), lay.end());
+                        uint32_t ntot = uint32_t(init.size()), ctot = 0;
+                        for (uint32_t k = 0; k < 16; ++k) {
+                            const uint32_t thr = uint32_t(std::ceil(f * double(q[k])));
+                            tab.push_back(q[k]);
+                            tab.push_back(thr);
+                            ntot += std::min(thr, q[k]); ctot += q[k] - std::min(thr, q[k]);
+                        }
+                        tab.push_back(ntot); tab.push_back(ctot);
+                    }
                     std::vector<uint8_t> tb(tab.size() * 4);
                     std::memcpy(tb.data(), tab.data(), tb.size());
                     pp.df_off = uint32_t(put(tb, 16) / 4);
@@ -3075,7 +3283,8 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 pp.sync_off = uint32_t(act_total / 4);
                 if (C == 256 && g_chain_epoch_word == 0xFFFFFFFFu) g_chain_epoch_word = pp.sync_off + 2u;
                 // DF mode appends the ready queue (one tagged entry per item) and its tail.
-                act_total += align(size_t(4 + windows + wg + (NR_PERSIST_DF ? windows + 1 : 0)) * 4, 256);
+                act_total += align(size_t(4 + windows + wg + (NR_PERSIST_DF ? windows + 1 : 0)
+                                          + (run_strag > 0 ? 18 + windows + 8 : 0)) * 4, 256);
                 pp.n_layers = n; pp.spin_limit = spin_limit;
                 pp.total_windows = windows;
                 Disp m{disp[i].s};
@@ -3089,10 +3298,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 std::memcpy(m.push.data(), &pp, sizeof pp);
                 persist_err.push_back(uint32_t((pp.sync_off + 3u) * 4u));
                 std::printf("persist: C=%d layers b%03dl%d..b%03dl%d (%u%s) windows %u"
-                            " items %u wg %u\n", C, disp[i].s->block, disp[i].s->layer,
+                            " items %u wg %u%s\n", C, disp[i].s->block, disp[i].s->layer,
                             disp[j].s->block, disp[j].s->layer, n,
                             ds_fold ? ", last is DS" : up_fold ? ", first is UPS" : "",
-                            most, windows, wg);
+                            most, windows, wg, one ? " (one per item)" : "");
                 out.push_back(std::move(m));
                 i = j + 1;
             }
@@ -3305,12 +3514,25 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         std::printf("native working extent %ux%u; source/output %dx%d\n",in_w,in_h,source_w,source_h);
         in_w=out_w=uint32_t(source_w);in_h=out_h=uint32_t(source_h);
     }
+    // `--tex-in-format N` (the runtime, one pass at the frame's own extent): the
+    // input image in the caller's format, filled by a plain copy each frame.
+    // Every kernel samples it, and sampling converts exactly as the blit into
+    // RGBA32F did, so the network sees the same values for a quarter of the
+    // bytes. Nothing writes it as storage on that path.
+    const VkFormat tex_in_format = arg(argc, argv, "--tex-in-format")
+        ? VkFormat(std::atoi(arg(argc, argv, "--tex-in-format"))) : VK_FORMAT_R32G32B32A32_SFLOAT;
     tex_in =
         ctx.image(std::max(in_w, 1u), std::max(in_h, 1u),
-                  VK_FORMAT_R32G32B32A32_SFLOAT, true);
+                  tex_in_format, true, true, tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT);
+    // `--out0-format N` (the runtime, native compose, one pass): the post
+    // block's answer image in the frame's own format, so the write-back is a
+    // copy. Only formats whose store converts exactly as the write-back blit
+    // did (nr_runtime.cpp); --out-image cannot read such an image back.
+    const VkFormat out0_format = arg(argc, argv, "--out0-format")
+        ? VkFormat(std::atoi(arg(argc, argv, "--out0-format"))) : VK_FORMAT_R32G32B32A32_SFLOAT;
     surf0 =
         ctx.image(std::max(out_w, 1u), std::max(out_h, 1u),
-                  VK_FORMAT_R32G32B32A32_SFLOAT, false);
+                  out0_format, false);
     surf1 =
         ctx.image(std::max(out_w, 1u), std::max(out_h, 1u),
                   VK_FORMAT_R32G32B32A32_SFLOAT, false);
@@ -3345,13 +3567,46 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     q[1] = float(y) / float(in_h ? in_h : 1);
                     q[2] = 0.5f; q[3] = 1.0f;
                 }
-        ctx.upload(tex_in, px.data(), px.size() * 4);
+        if (tex_in_format == VK_FORMAT_R32G32B32A32_SFLOAT) ctx.upload(tex_in, px.data(), px.size() * 4);
+        else if (tex_in_format == VK_FORMAT_B8G8R8A8_UNORM || tex_in_format == VK_FORMAT_R8G8B8A8_UNORM) {
+            // The same picture as an 8-bit frame, for checking the runtime's
+            // 8-bit input path from the command line (--in-image on k/255).
+            std::vector<uint8_t> b8(px.size());
+            for (size_t i = 0; i < px.size(); i += 4)
+                for (int k = 0; k < 4; ++k) {
+                    const int src = tex_in_format == VK_FORMAT_B8G8R8A8_UNORM && k < 3 ? 2 - k : k;
+                    b8[i + k] = uint8_t(std::lround(std::min(std::max(px[i + src], 0.f), 1.f) * 255.f));
+                }
+            ctx.upload(tex_in, b8.data(), b8.size());
+        }
     }
     timer.mark("input-image");
     nr::logf("uploading weights: %.1f MB through a mapped staging buffer of the same size",
              double(wblob.size()) / 1e6);
     ctx.upload(wgt, 0, wblob.data(), wblob.size());
     timer.mark("weights-upload");
+    // The pre-block's noise features (NR_NOISE_FIELD): a fixed function of pixel,
+    // seed and gain, filled once here into the zeroed regions the lowering put
+    // in the weight blob, by the same GLSL the pre-block would run per frame.
+    if (!g_noise_jobs.empty()) {
+        nrvk::Kernel nk;
+        nk.create(ctx, spv_dir + "/g_noisefield.spv", {wgt.handle}, uint32_t(sizeof(NoiseJob)));
+        ctx.one_shot([&](VkCommandBuffer cmd) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nk.layout, 0, 1, &nk.set, 0, nullptr);
+            for (const NoiseJob& j : g_noise_jobs) {
+                vkCmdPushConstants(cmd, nk.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof j, &j);
+                vkCmdDispatch(cmd, (j.width + 7u) / 8u, (j.height + 7u) / 8u, 1);
+            }
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 1, &mb, 0, nullptr, 0, nullptr);
+        });
+        nk.destroy();
+        timer.mark("noise-field");
+    }
 
     // **The arena is not seeded here.** It used to be filled with a plausible
     // activation distribution, one staged 16 MB upload at a time, because an
@@ -3465,7 +3720,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         else if (d.kern == "attn")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
                                          wgt.handle, act.handle}, sizeof(PushAttn) + (g_chain_kern.count(d.kern) ? 16 : 0));
-        else if (d.kern == "ffwd3")
+        else if (d.kern == "ffwd3" || d.kern == "ffwd3w")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle,
                                          wgt.handle, wgt.handle, act.handle},
                                 sizeof(PushFfwd3) + (g_chain_kern.count(d.kern) ? 16 : 0));
@@ -3722,6 +3977,10 @@ int main(int argc, char** argv) try {
         }
     };
     auto write_surface = [&]() {
+    if (surf0.format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+        std::printf("surface 0: not RGBA32F (--out0-format), not read back\n");
+        return;
+    }
     if (out_w && out_h) {
         std::vector<float> px(size_t(out_w) * out_h * 4);
         ctx.download(surf0, px.data(), px.size() * 4);

@@ -46,23 +46,30 @@ instructions the network needs.
 
 ## Performance
 
-GPU time of the network per frame on an RX 9070 XT, offline benchmark (network only):
+GPU time of the network per frame on an RX 9070 XT, offline benchmark (network only; Linux: mean of
+three runs):
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
-| Linux | 6.2 ms | 10.7 ms | 23.5 ms |
+| Linux | 6.00 ms | 10.41 ms | 22.87 ms |
 | Windows | 9.4 ms | - | 33 ms |
 
 In game (Linux, RX 9070 XT):
 
 | Game | Setting | Output | Render | Model | Without NR | With NR |
 | --- | --- | --- | --- | --- | --- | --- |
+| 007 First Light (v0.0.2) | FSR4 Performance, NR before upscaler | 4K | 1080p | 1080p | 126 fps | 68 fps |
+| 007 First Light (v0.0.2) | FSR4 Performance, NR after upscaler | 4K | 1080p | 4K | 126 fps | 30 fps |
+| Kingdom Come: Deliverance II (v0.0.2) | FSR4 Performance, NR before upscaler | 4K | 1080p | 1080p | 85 fps | 54 fps |
+| Kingdom Come: Deliverance II (v0.0.2) | FSR4 Performance, NR after upscaler | 4K | 1080p | 4K | 85 fps | 27 fps |
+| Dying Light: The Beast | FSR4 Performance, NR before upscaler | 4K | 1080p | 1080p | 97 fps | 56 fps |
+| Dying Light: The Beast | FSR4 Performance, NR after upscaler | 4K | 1080p | 4K | 97 fps | 27 fps |
 | Tomb Raider (2013) | Model resolution 50% | 4K | 4K | 1080p | 130 fps | 60 fps |
 | Tomb Raider (2013) | Model resolution 100% | 4K | 4K | 4K | 130 fps | 30 fps |
 | 7 Days to Die | FSR4 Performance, NR before upscaler | 4K | 1080p | 1080p | 136 fps | 68 fps |
 | 7 Days to Die | FSR4 Performance, NR after upscaler | 4K | 1080p | 4K | 136 fps | 29 fps |
-| Dying Light: The Beast | FSR4 Performance, NR before upscaler | 4K | 1080p | 1080p | 97 fps | 56 fps |
-| Dying Light: The Beast | FSR4 Performance, NR after upscaler | 4K | 1080p | 4K | 97 fps | 27 fps |
+
+Rows marked (v0.0.2) were measured with version 0.0.2, the others with 0.0.1.
 
 Running the model below the output resolution about doubles the frame rate. In the ReShade routes
 that is the **Model resolution** setting. In the OptiScaler route it is mainly OptiScaler-NR's

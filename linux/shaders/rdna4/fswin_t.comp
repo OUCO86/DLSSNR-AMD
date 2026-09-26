@@ -11,6 +11,38 @@
 #extension GL_EXT_spirv_intrinsics : require
 spirv_execution_mode(capabilities = [4468], 4463, 16);
 #endif
+#ifndef NR_POST_NO_OUT1
+#define NR_POST_NO_OUT1 0
+#endif
+#ifndef NR_OUT0_NOFORMAT
+#define NR_OUT0_NOFORMAT 0
+#endif
+#ifndef NR_HALF_RTE
+#define NR_HALF_RTE 0
+#endif
+#if NR_HALF_RTE
+// f32 -> f16 conversions round to nearest even, as the original's
+// cvt.rn.f16.f32 does. Undecorated, the rounding is the implementation's
+// choice, and RADV then folds the pre block's f16vec3(textureLod(..)) into a
+// 16-bit texture return (d16), which the texture unit truncates for a 32-bit
+// float texel and rounds for an 8-bit one. With this mode the sample stays f32
+// and v_cvt_f16_f32 rounds to nearest - the original's input values, the same
+// for every input format. Scalar conversions already rounded to nearest under
+// the default MODE; the rest of the kernel is only rescheduled. Needs
+// shaderRoundingModeRTEFloat16 (RADV: yes).
+#extension GL_EXT_spirv_intrinsics : require
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
+#endif
+#ifndef NR_IO_DOT2
+#define NR_IO_DOT2 0
+#endif
+#if NR_IO_DOT2
+// The RGB output projection's channel pairs as one mixed dot product,
+// f16 x f16 pairs into an f32 accumulator (VK_VALVE_shader_mixed_float_dot_product,
+// V_DOT2_F32_F16) instead of two fma_mix. The products of two halves are exact
+// in f32; the native projection accumulates in f16.
+#extension GL_EXT_spirv_intrinsics : require
+#endif
 #ifndef NR_PERSIST
 #define NR_PERSIST 0
 #endif
@@ -111,6 +143,10 @@ spirv_execution_mode(capabilities = [4468], 4463, 16);
 #endif
 #include "coopmm.glsl"
 #include "swin_math.glsl"
+#if NR_IO_DOT2
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float nr_fdot2mix(f16vec2 a, f16vec2 b, float acc);
+#endif
 
 // The fused Swin block, carried **transposed**: every matrix is
 // [feature][token], weights are the A operand and activations are B.
@@ -567,6 +603,15 @@ spirv_execution_mode(capabilities = [4468], 4463, 16);
 // `fswinblendpost32`, all NR_FWAVES=2) and came back 0.6% faster for it. The
 // standalone harness cannot catch this: it builds NR_FWAVES=1 and scores
 // 94.2% either way.
+// NR_V_SWAP: the head-split body's V projection multiplies X . Wv^T so V
+// stays in registers as the context product's A operand (no lds_y round trip).
+#ifndef NR_V_SWAP
+#define NR_V_SWAP 0
+#endif
+// One wave owns the window: V never leaves registers. Otherwise (NR_FWAVES=2)
+// the swapped V goes to lds_v as before, stored ColumnMajor - the same
+// addresses, but a lane's eight bytes are now contiguous (one ds_store_b64).
+#define NR_V_REGS (NR_V_SWAP && (NR_HWAVES || NR_MF == NR_JF))
 #if NR_K_REGS && (NR_MF < NR_JF)
 #error "NR_K_REGS needs one wave per window (NR_MF >= NR_JF): NR_FWAVES=1 or NR_HWAVES=1"
 #endif
@@ -923,8 +968,17 @@ spirv_execution_mode(capabilities = [4468], 4463, 16);
 #if NR_QK_SCALE_FAST >= 3 && !NR_NORM_F32
 #error "these Q/K experiments require the FP32 square reduction"
 #endif
+// NR_QK_SAT: mode 5's products through the saturating convert. The values are
+// bounded (|q| <= ~1 * |scale| < 20, far below 448), so the result is the same
+// bytes; the point is the MODE register - a bare convert needs FP16_OVFL clear,
+// so Q/K interleaved with saturating V/P converts made ACO toggle it.
+#ifndef NR_QK_SAT
+#define NR_QK_SAT 0
+#endif
 fe4m3vec2 nr_qscale_fast(vec2 value, float norm, float16_t scale) {
-#if NR_QK_SCALE_FAST == 1
+#if NR_QK_SCALE_FAST == 5 && NR_QK_SAT
+    return nr_quant_pair32(value * (norm * float(scale)));
+#elif NR_QK_SCALE_FAST == 1
     return nr_quant_pair(f16vec2(value) * f16vec2(float16_t(norm) * scale));
 #elif NR_QK_SCALE_FAST == 4
     return fe4m3vec2((f16vec2(value) * f16vec2(float16_t(norm))) * f16vec2(scale));
@@ -935,7 +989,9 @@ fe4m3vec2 nr_qscale_fast(vec2 value, float norm, float16_t scale) {
 #endif
 }
 fe4m3vec2 nr_kscale_fast(vec2 value, float norm) {
-#if NR_QK_SCALE_FAST == 1
+#if NR_QK_SCALE_FAST == 5 && NR_QK_SAT
+    return nr_quant_pair32(value * norm);
+#elif NR_QK_SCALE_FAST == 1
     return nr_quant_pair(f16vec2(value) * f16vec2(norm));
 #elif NR_QK_SCALE_FAST == 4
     return fe4m3vec2(f16vec2(value) * f16vec2(float16_t(norm)));
@@ -1356,7 +1412,25 @@ layout(set = 0, binding = 4, std430) readonly buffer WExpandPair4 { fe4m3vec4 we
 layout(set = 0, binding = 5, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_e4m3x4[]; };
 #endif
 
-#if defined(NR_FUSED_POST_BLEND) && NR_BLEND_VECTOR_LOAD
+// NR_BLEND_G32: the packed blends read each f16 gain pair as one u32
+// (blend_g_off is 16-byte aligned by put_f16, channel pairs are even).
+#ifndef NR_BLEND_G32
+#define NR_BLEND_G32 0
+#endif
+// NR_DS_QPAIR: the fused DS projection's output conversion in pairs
+// (mode 4's nr_quant_pair is the scalar nr_quant_e4m3 per component).
+#ifndef NR_DS_QPAIR
+#define NR_DS_QPAIR 0
+#endif
+#if NR_DS_QPAIR && !(NR_QUANT_MODE == 4 && NR_QUANT_PAIRED)
+#error "NR_DS_QPAIR: mode-4 paired quantiser only"
+#endif
+// NR_UPS_BLEND_PK: the fused upsample's skip blend two channels an
+// instruction, the post blend's spelling (below, at the blend itself).
+#ifndef NR_UPS_BLEND_PK
+#define NR_UPS_BLEND_PK 0
+#endif
+#if (defined(NR_FUSED_POST_BLEND) && NR_BLEND_VECTOR_LOAD) || (defined(NR_FUSED_UPS_BLEND) && NR_UPS_BLEND_PK)
 layout(set = 0, binding = 0, std430) NR_COH readonly buffer BlendE4M3x4 {
     fe4m3vec4 blend_e4m3x4[];
 };
@@ -1384,14 +1458,32 @@ layout(set = 0, binding = 0, std430) NR_COH readonly buffer BlendE4M3x4 {
 //   [0] = (history and motion are usable, mv scale x, mv scale y, history strength)
 //   [1] = (history width, history height, depth present, depth inverted)
 layout(set=0,binding=5,std430) readonly buffer NrTemporal { vec4 nr_temporal[2]; };
+#if NR_OUT0_NOFORMAT
+// The answer image's format comes from its view: the runtime hands the post
+// block an image in the frame's own format when the store converts exactly as
+// the write-back blit would (the write-back is then a copy); RGBA32F behaves
+// as before. Formatless storage writes: Vulkan 1.3 allows them for a format
+// with STORAGE_WRITE_WITHOUT_FORMAT, and the runtime checks that bit.
+layout(set=0,binding=6) uniform writeonly image2D nr_out0;
+#else
 layout(set=0,binding=6,rgba32f) uniform writeonly image2D nr_out0;
+#endif
 layout(set=0,binding=7,rgba32f) uniform writeonly image2D nr_out1;
 layout(set=0,binding=8) uniform sampler2D nr_src;
 layout(set=0,binding=9) uniform sampler2D nr_motion;
 layout(set=0,binding=10) uniform sampler2D nr_history;
 #include "temporal_history.glsl"
 #else
+#if NR_OUT0_NOFORMAT
+// The answer image's format comes from its view: the runtime hands the post
+// block an image in the frame's own format when the store converts exactly as
+// the write-back blit would (the write-back is then a copy); RGBA32F behaves
+// as before. Formatless storage writes: Vulkan 1.3 allows them for a format
+// with STORAGE_WRITE_WITHOUT_FORMAT, and the runtime checks that bit.
+layout(set=0,binding=5) uniform writeonly image2D nr_out0;
+#else
 layout(set=0,binding=5,rgba32f) uniform writeonly image2D nr_out0;
+#endif
 layout(set=0,binding=6,rgba32f) uniform writeonly image2D nr_out1;
 layout(set=0,binding=7) uniform sampler2D nr_src;
 #endif
@@ -1640,27 +1732,52 @@ layout(push_constant) uniform Push {
     uint ups_weight_off;
 #endif
 #ifdef NR_FUSED_IMAGE_OUTPUT
-    uint image_w_off;
+    uint image_w_off;       // NR_POST_ALPHA: bit 31 restore alpha, bit 30 8-bit rounding
     float image_intensity;
 #endif
 #ifdef NR_FUSED_IMAGE_INPUT
     uint image_lift_off,image_source_W,image_source_H,image_seed;
     float image_style,image_tone,image_structure,image_skin,image_other,image_noise,image_constant;
+#if NR_NOISE_FIELD
+    uint image_noise_off;   // u32 index of the precomputed noise features, 0: none
+#endif
 #endif
 } pc;
 #endif
 
 // The host pads the window grid for negative per-axis shifts. The PTX
 // zero-fills out-of-range input tiles and suppresses their output stores.
+// NR_PRE_FULL - CLOSED, keep 0 (no time). A poisoning diagnostic (bit 16) proved
+// no out-of-range tile ever occurs in the fused pre-block (3 extents + 5 NVIDIA
+// controls). Bit 2 alone moved the controls by up to -1.37 dB only because, with
+// the tile branch gone, NIR folded f2f32(f2f16(lift)) and dropped the lift's
+// native f16 rounding; bit 64 keeps an opaque branch there and 1|2|4|64 (=71) is
+// byte-identical, -574 static instructions - but all scalar/branch: pre 540 us
+// either way. The -24 us bit 2 showed was the removed rounding itself. Contract:
+// the fused image pre-block's contract. The host selects
+// fswinimagepreds32 only for W%8 == H%8 == 0, zero shifts, tiles = extent/4 and
+// a W/8 x H/8 window grid (nr_graph.cpp, imgin16wmma fold), and checks
+// pool_tiles*2 >= tiles there, so every tile and every pooled pixel is in range:
+// the clamps are identities and the out-of-range tests constant false.
+#ifndef NR_PRE_FULL
+#define NR_PRE_FULL 0
+#endif
 #if NR_IMAGE
 uint nr_tile_base(uint q) {
+#if NR_PRE_FULL & 1
+    const uint tx=2u*nr_wx+(q&1u), ty=2u*nr_wy+(q>>1);
+    return (ty*pc.tiles_x+tx)*uint(NR_C/16)*256u;
+#else
     int tx=2*int(nr_wx)+pc.shift+int(q&1u);
     int ty=2*int(nr_wy)+pc.shift_y+int(q>>1);
     tx=clamp(tx,0,int(pc.tiles_x)-1);ty=clamp(ty,0,int(pc.tiles_y)-1);
     return (uint(ty)*pc.tiles_x+uint(tx))*uint(NR_C/16)*256u;
+#endif
 }
 bool nr_tile_oob(uint q) {
-#if NR_ABLATE_OOB
+#if NR_PRE_FULL & 2
+    return false;
+#elif NR_ABLATE_OOB
     // Diagnostic only, wrong output at the padded edge of the window grid.
     // Prices the whole out-of-bounds path: the per-component zeroing of the
     // input fragments and the suppressed output stores.
@@ -1914,6 +2031,63 @@ float nr_act_horner(float x) {
     return x*fma(t,u,0.89453125);
 }
 #define nr_mp_cubic_silu nr_act_horner
+// NR_ACT_ALT: the second value of each pair spells the same Horner steps
+// with the multiplicands swapped (bit-identical: IEEE fma/mul commute), so the
+// register allocator sees different killed operands for adjacent values and
+// can meet VOPD's even/odd destination rule more often. 1 both, 2 mul, 3 fma.
+#ifndef NR_ACT_ALT
+#define NR_ACT_ALT 0
+#endif
+// Modes 1-3 as before; 4..11 are the bit set (mode-4): bit0 swaps u's fma,
+// bit1 w's fma, bit2 the final mul (4 = none, 11 = all).
+#if NR_ACT_ALT >= 4
+#define NR_ALT_U (((NR_ACT_ALT - 4) & 1) != 0)
+#define NR_ALT_W (((NR_ACT_ALT - 4) & 2) != 0)
+#define NR_ALT_M (((NR_ACT_ALT - 4) & 4) != 0)
+#else
+#define NR_ALT_U (NR_ACT_ALT == 1 || NR_ACT_ALT == 3)
+#define NR_ALT_W (NR_ACT_ALT == 1 || NR_ACT_ALT == 3)
+#define NR_ALT_M (NR_ACT_ALT == 1 || NR_ACT_ALT == 2)
+#endif
+float nr_act_horner_b(float x) {
+    const float t=clamp(x,-4.0,4.0);
+#if NR_ALT_U
+    const float u=fma(abs(t),-0.055908203125,0.447265625);
+#else
+    const float u=fma(-0.055908203125,abs(t),0.447265625);
+#endif
+#if NR_ALT_W
+    const float w=fma(u,t,0.89453125);
+#else
+    const float w=fma(t,u,0.89453125);
+#endif
+#if NR_ALT_M
+    return w*x;
+#else
+    return x*w;
+#endif
+}
+#if NR_ACT_ALT
+#define nr_mp_cubic_silu_b nr_act_horner_b
+#else
+#define nr_mp_cubic_silu_b nr_act_horner
+#endif
+#if NR_ACT_PAT
+#define NR_ACTP(x, c)   nr_act_pick(x, c)
+#define NR_ACTP_B(x, c) nr_act_pick(x, c)
+#else
+#define NR_ACTP(x, c)   nr_mp_cubic_silu(x)
+#define NR_ACTP_B(x, c) nr_mp_cubic_silu_b(x)
+#endif
+// NR_ACT_PAT: which values of a component run take the _b spelling -
+// parity of (component index & mask). 0 keeps the pairwise call sites
+// (second of each pair). Constant after unrolling, so one call survives.
+#ifndef NR_ACT_PAT
+#define NR_ACT_PAT 0
+#endif
+float nr_act_pick(float x, int c) {
+    return (bitCount(uint(c) & uint(NR_ACT_PAT)) & 1) != 0 ? nr_act_horner_b(x) : nr_act_horner(x);
+}
 #endif
 // MpCubicSiluActivation, recovered from 1936 call sites.
 float nr_act(float x) {
@@ -2061,6 +2235,21 @@ float nr_fast_exp(float x) {
 #define NR_RND(a) {}
 #endif
 
+#ifndef NR_NOISE_FIELD
+#define NR_NOISE_FIELD 0
+#endif
+// NR_POST_ALPHA: the runtime's alpha pass folded into the post block's store
+// (native compose: the answer is written once, not written, read and written
+// again). Flags in image_w_off's top bits, set by the runtime: bit 31 takes the
+// source's alpha instead of 1, bit 30 applies the alpha pass's 8-bit rounding.
+#ifndef NR_POST_ALPHA
+#define NR_POST_ALPHA 0
+#endif
+#if NR_POST_ALPHA
+#define NR_IMG_WOFF (pc.image_w_off & 0x3FFFFFFFu)
+#else
+#define NR_IMG_WOFF pc.image_w_off
+#endif
 #ifdef NR_FUSED_IMAGE_INPUT
 #include "image_input.glsl"
 #endif
@@ -2156,6 +2345,34 @@ void main() {
     const uint nr_qbase = pcp.sync_off + 4u + pcp.total_windows + gl_NumWorkGroups.x;
     const uint nr_tail = nr_qbase + pcp.total_windows;
     const uint nr_tag = (nr_epoch & 0xFFFFu) << 16u;
+#if NR_STRAG
+    // straggler queue: an item whose ready-rank in its layer (per frame:
+    // a monotonic per-layer counter modulo the layer's queued-item count) is
+    // at or above the layer's threshold goes to a second queue that only the
+    // oldest workgroup of each CU claims (old: that queue first, then the
+    // normal one; younger: normal only). Such items finish their layer late,
+    // so they are the run's critical chain; oldest-first arbitration makes a
+    // younger workgroup run them ~2.5x slower. Tables after the DF init list:
+    // df_off + 6*TW item -> layer, df_off + 7*TW (queued, threshold) a layer.
+    // Sync words after the tail: crit head, crit tail, 16 rank counters, queue.
+    const uint nr_chead = nr_tail + 1u, nr_ctail = nr_tail + 2u;
+    const uint nr_rank = nr_tail + 3u, nr_cq = nr_tail + 19u;
+#define NR_ENQUEUE(c) { \
+        const uint nr_k = wgt_u32[pcp.df_off + 6u * pcp.total_windows + (c)]; \
+        const uint nr_q = wgt_u32[pcp.df_off + 7u * pcp.total_windows + 2u * nr_k]; \
+        const uint nr_t = wgt_u32[pcp.df_off + 7u * pcp.total_windows + 2u * nr_k + 1u]; \
+        const uint nr_r = atomicAdd(nr_sync[nr_rank + nr_k], 1u) % max(nr_q, 1u); \
+        if (nr_r >= nr_t) { const uint pos = atomicAdd(nr_sync[nr_ctail], 1u); \
+                            atomicExchange(nr_sync[nr_cq + pos], nr_tag | (c)); } \
+        else { const uint pos = atomicAdd(nr_sync[nr_tail], 1u); \
+               atomicExchange(nr_sync[nr_qbase + pos], nr_tag | (c)); } }
+#else
+#define NR_ENQUEUE(c) { const uint pos = atomicAdd(nr_sync[nr_tail], 1u); \
+                        atomicExchange(nr_sync[nr_qbase + pos], nr_tag | (c)); }
+#endif
+#endif
+#ifndef NR_STRAG
+#define NR_STRAG 0
 #endif
 #ifndef NR_YX_PCT
 #define NR_YX_PCT 100
@@ -2180,6 +2397,20 @@ void main() {
 #endif
 #if NR_FAIR
     uint nr_fair_done = 0u;
+#endif
+#ifndef NR_STRAG_ESC
+#define NR_STRAG_ESC 0
+#endif
+#ifndef NR_PERSIST_ONE
+#define NR_PERSIST_ONE 0
+#endif
+#if NR_PERSIST_ONE && (NR_STRAG == 1 || !NR_PERSIST_DF || NR_PBATCH > 1)
+#error "NR_PERSIST_ONE: dependency-driven single-item claims (a blocking straggler queue at most)"
+#endif
+#if NR_STRAG_ESC
+    // A normal-queue reservation an old workgroup set aside to run a straggler
+    // (see the wait loop below); taken up again at the next claim.
+    uint nr_held = 0xFFFFFFFFu;
 #endif
     while (true) {
         // Claim, then broadcast through the slot. `atomicExchange` of the
@@ -2215,6 +2446,114 @@ void main() {
                 }
             }
 #endif
+#if NR_STRAG == 2
+#if NR_PBATCH > 1 || NR_YOUNG_THR
+#error "NR_STRAG: single-item claims only"
+#endif
+            // Blocking reservations, as the plain DF queue: each queue's per-frame
+            // total is fixed (a layer sends exactly queued - threshold items to
+            // the straggler queue), so every reserved position is eventually
+            // filled. Young workgroups use the normal queue only and leave when it
+            // is exhausted; old ones take a straggler when one is waiting, else a
+            // normal item, else the stragglers left.
+            uint it = pcp.total_windows;
+            const bool nr_old = gl_WorkGroupID.x < uint(NR_YOUNG_CUS);
+            const uint nr_ntot = wgt_u32[pcp.df_off + 7u * pcp.total_windows + 32u];
+            const uint nr_ctot = wgt_u32[pcp.df_off + 7u * pcp.total_windows + 33u];
+            uint qa = 0xFFFFFFFFu;
+            bool nr_take_c = false;
+#if NR_STRAG_ESC
+            bool nr_qn = false;         // qa is a normal-queue position
+            if (nr_held != 0xFFFFFFFFu) { qa = nr_held; nr_held = 0xFFFFFFFFu; nr_qn = true; nr_take_c = true; }
+            if (nr_old && qa == 0xFFFFFFFFu) {
+#else
+            if (nr_old) {
+#endif
+                const uint ch = atomicAdd(nr_sync[nr_chead], 0u);
+                nr_take_c = ch < nr_ctot && ch < atomicAdd(nr_sync[nr_ctail], 0u);
+            }
+#if NR_STRAG_ESC
+            if (nr_take_c && qa == 0xFFFFFFFFu) {
+#else
+            if (nr_take_c) {
+#endif
+                const uint pos = atomicAdd(nr_sync[nr_chead], 1u);
+                if (pos < nr_ctot) qa = nr_cq + pos;
+            }
+            if (qa == 0xFFFFFFFFu) {
+                const uint pos = atomicAdd(nr_sync[pcp.sync_off + 0u], 1u);
+                if (pos < nr_ntot) {
+                    if (pos < pcp.df_n0) it = wgt_u32[pcp.df_off + 5u * pcp.total_windows + pos];
+                    else qa = nr_qbase + (pos - pcp.df_n0);
+#if NR_STRAG_ESC
+                    nr_qn = qa != 0xFFFFFFFFu;
+#endif
+                } else if (nr_old) {
+                    const uint cp = atomicAdd(nr_sync[nr_chead], 1u);
+                    if (cp < nr_ctot) qa = nr_cq + cp;
+                }
+            }
+            if (qa != 0xFFFFFFFFu) {
+                uint e = atomicAdd(nr_sync[qa], 0u);
+#if NR_STRAG_ESC
+                uint nr_poll = 0u;
+#endif
+                while ((e & 0xFFFF0000u) != nr_tag) {
+                    if (nr_budget == 0u) { atomicMax(nr_sync[pcp.sync_off + 3u], 1u); break; }
+                    --nr_budget;
+#if NR_STRAG_ESC
+                    // Never sit on a normal reservation while a straggler waits:
+                    // only old workgroups take stragglers, so with every old one
+                    // parked here and a young one enqueueing the last stragglers
+                    // the run could stall until the spin budget ran out. Take an
+                    // enqueued one (CAS, no second reservation) and come back to
+                    // this position at the next claim.
+                    if (nr_old && nr_qn && ((++nr_poll) & 31u) == 0u) {
+                        const uint ch = atomicAdd(nr_sync[nr_chead], 0u);
+                        if (ch < nr_ctot && ch < atomicAdd(nr_sync[nr_ctail], 0u) &&
+                            atomicCompSwap(nr_sync[nr_chead], ch, ch + 1u) == ch) {
+                            nr_held = qa; qa = nr_cq + ch; nr_qn = false;
+                        }
+                    }
+#endif
+                    e = atomicAdd(nr_sync[qa], 0u);
+                }
+                if ((e & 0xFFFF0000u) == nr_tag) it = e & 0xFFFFu;
+            }
+#elif NR_STRAG
+#if NR_PBATCH > 1 || NR_YOUNG_THR
+#error "NR_STRAG: single-item claims only"
+#endif
+            // Non-blocking: a reservation would wait on the other queue forever.
+            uint it = pcp.total_windows;
+            const bool nr_old = gl_WorkGroupID.x < uint(NR_YOUNG_CUS);
+            for (;;) {
+                const uint nh = atomicAdd(nr_sync[pcp.sync_off + 0u], 0u);
+                const uint ch = atomicAdd(nr_sync[nr_chead], 0u);
+                if (nh + ch >= pcp.total_windows) break;
+                uint qa = 0xFFFFFFFFu;
+                if (nr_old && ch < atomicAdd(nr_sync[nr_ctail], 0u)) {
+                    if (atomicCompSwap(nr_sync[nr_chead], ch, ch + 1u) == ch) qa = nr_cq + ch;
+                    else continue;
+                } else if (nh < pcp.df_n0 + atomicAdd(nr_sync[nr_tail], 0u)) {
+                    if (atomicCompSwap(nr_sync[pcp.sync_off + 0u], nh, nh + 1u) != nh) continue;
+                    if (nh < pcp.df_n0) { it = wgt_u32[pcp.df_off + 5u * pcp.total_windows + nh]; break; }
+                    qa = nr_qbase + (nh - pcp.df_n0);
+                }
+                if (qa != 0xFFFFFFFFu) {
+                    uint e = atomicAdd(nr_sync[qa], 0u);
+                    while ((e & 0xFFFF0000u) != nr_tag) {
+                        if (nr_budget == 0u) { atomicMax(nr_sync[pcp.sync_off + 3u], 1u); break; }
+                        --nr_budget;
+                        e = atomicAdd(nr_sync[qa], 0u);
+                    }
+                    if ((e & 0xFFFF0000u) == nr_tag) it = e & 0xFFFFu;
+                    break;
+                }
+                if (nr_budget == 0u) { atomicMax(nr_sync[pcp.sync_off + 3u], 1u); break; }
+                --nr_budget;
+            }
+#else
             const uint h = atomicAdd(nr_sync[pcp.sync_off + 0u], 1u);
             uint it = pcp.total_windows;
             if (h < pcp.df_n0) {
@@ -2232,6 +2571,7 @@ void main() {
                 }
                 if ((e & 0xFFFF0000u) == nr_tag) it = e & 0xFFFFu;
             }
+#endif
 #if NR_PBATCH > 1
             // A second item only if one is ready right now - waiting for
             // it would hold the first, which is the critical path. Without one
@@ -2398,10 +2738,7 @@ void main() {
                 if (c != 0xFFFFFFFFu) {
                     const uint need = wgt_u32[pcp.df_off + c];
                     const uint old = atomicAdd(nr_sync[pcp.sync_off + 4u + c], 1u);
-                    if (old + 1u == need * nr_epoch) {
-                        const uint pos = atomicAdd(nr_sync[nr_tail], 1u);
-                        atomicExchange(nr_sync[nr_qbase + pos], nr_tag | c);
-                    }
+                    if (old + 1u == need * nr_epoch) NR_ENQUEUE(c)
                 }
             }
             barrier();
@@ -2693,6 +3030,36 @@ void main() {
             const uint islot=(ipy%4u)*4u+ipx%4u;
             const uint stw=pc.blend_stiles_x!=0u?pc.blend_stiles_x:pc.blend_tiles_x;
             const uint stile=ty*stw+tx;
+#if NR_UPS_BLEND_PK
+            // The scalar chain below compiles to one v_fma_f16 a channel
+            // (ACO contracts sv*g into the add); v_pk_fma_f16 rounds the same
+            // way per half. e4m3 -> f16 is exact, so the pair pack loses nothing.
+            {
+                const uint saddr=pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase;
+                const fe4m3vec4 sv4[2]={blend_e4m3x4[saddr/4u], blend_e4m3x4[saddr/4u+1u]};
+                for(int j=0;j<8;j+=2) {
+                    const uint ch=uint(k)*16u+rbase+uint(j);
+#ifdef NR_FUSED_UPS_PROJECT
+                    const uint local_slot=((q>>1u)*2u+dy/2u)*4u+(q&1u)*2u+dx/2u;
+                    const uint pb=uint(k)*256u+local_slot*16u+rbase+uint(j);
+                    const f16vec2 pv2=f16vec2(ups_projected[pb],ups_projected[pb+1u]);
+#else
+                    const uint pb=pc.blend_p_off/2u+(itile*uint(NR_CF)+uint(k))*256u+islot*16u+rbase+uint(j);
+                    const f16vec2 pv2=f16vec2(act_f16[pb],act_f16[pb+1u]);
+#endif
+                    const f16vec2 sv2=unpackFloat2x16(packHalf2x16(vec2(
+                        float(sv4[j/4][j%4]), float(sv4[j/4][j%4+1]))));
+#if NR_BLEND_G32
+                    const f16vec2 g2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+ch)>>1u]);
+#else
+                    const f16vec2 g2=f16vec2(wgt_f16[pc.blend_g_off+ch],wgt_f16[pc.blend_g_off+ch+1u]);
+#endif
+                    const f16vec2 xh2=fma(sv2,g2,pv2);
+                    xh[m][k][j]=xh2.x; xh[m][k][j+1]=xh2.y;
+                }
+            }
+            if(false)
+#endif
             for(int j=0;j<8;++j) {
                 const uint ch=uint(k)*16u+rbase+uint(j);
 #ifdef NR_FUSED_UPS_PROJECT
@@ -2741,10 +3108,15 @@ void main() {
                     float(pv4[j/4][j%4]), float(pv4[j/4][j%4+1]))));
                 const f16vec2 sv2=unpackFloat2x16(packHalf2x16(vec2(
                     float(sv4[j/4][j%4]), float(sv4[j/4][j%4+1]))));
+#if NR_BLEND_G32
+                const f16vec2 gm2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+uint(NR_C)+ch)>>1u]);
+                const f16vec2 gs2=unpackFloat2x16(wgt_u32[(pc.blend_g_off+ch)>>1u]);
+#else
                 const f16vec2 gm2=f16vec2(wgt_f16[pc.blend_g_off+uint(NR_C)+ch],
                                           wgt_f16[pc.blend_g_off+uint(NR_C)+ch+1u]);
                 const f16vec2 gs2=f16vec2(wgt_f16[pc.blend_g_off+ch],
                                           wgt_f16[pc.blend_g_off+ch+1u]);
+#endif
                 const f16vec2 xh2=fma(sv2,gs2,pv2*gm2);
                 xh[m][k][j]=xh2.x; xh[m][k][j+1]=xh2.y;
             }
@@ -2771,7 +3143,16 @@ void main() {
             // The tile test is wave-uniform. Flattened, it was eight
             // `v_cndmask` a fragment (plus two on xb below) on every window;
             // as a scalar branch it costs nothing where it is never taken.
+#if NR_PRE_FULL & 64
+            // The tile is always in range here (NR_PRE_FULL), but this
+            // branch is what keeps xh a real f16: without the merge NIR folds
+            // f2f32(f2f16(lifted)) away and the lift's f16 rounding (native)
+            // disappears - measured, -1.37 dB on the NVIDIA-replay controls.
+            // A condition the compiler cannot prove false keeps it; never taken.
+            [[dont_flatten]] if(pc.tiles_x == 0u)
+#else
             [[dont_flatten]] if(nr_tile_oob((tok0+uint(m)*16u)/16u))
+#endif
                 for (int j=0;j<8;++j) xh[m][k][j]=NR_F16(0.0);
 #endif
             for (int j=0;j<8;++j) {
@@ -2901,7 +3282,7 @@ void main() {
 #elif NR_ACT_F32
                 for (int c = 0; c < 8; c += 2) {
                     const fe4m3vec2 qp = nr_quant_pair32(vec2(
-                        nr_mp_cubic_silu(a[p][m][c]), nr_mp_cubic_silu(a[p][m][c + 1])));
+                        NR_ACTP(a[p][m][c], c), NR_ACTP_B(a[p][m][c + 1], c + 1)));
                     eqg[m][h + p][c] = qp.x;
                     eqg[m][h + p][c + 1] = qp.y;
                 }
@@ -2962,7 +3343,7 @@ void main() {
                 // conversion, a different rounding. See nr_quant_pair32.
                 for (int c = 0; c < 8; c += 2) {
                     const fe4m3vec2 qp = nr_quant_pair32(vec2(
-                        nr_mp_cubic_silu(a[m][c]), nr_mp_cubic_silu(a[m][c + 1])));
+                        NR_ACTP(a[m][c], c), NR_ACTP_B(a[m][c + 1], c + 1)));
                     eqg[m][h][c] = qp.x;
                     eqg[m][h][c + 1] = qp.y;
                 }
@@ -3137,7 +3518,7 @@ void main() {
             // nr_quant_pair32 for why the hop costs what it does.
             for (int c = 0; c < 8; c += 2) {
                 const fe4m3vec2 qp = nr_quant_pair32(vec2(
-                    nr_mp_cubic_silu(a[m][c]), nr_mp_cubic_silu(a[m][c + 1])));
+                    NR_ACTP(a[m][c], c), NR_ACTP_B(a[m][c + 1], c + 1)));
                 NR_EQ(m,h)[c] = qp.x;
                 NR_EQ(m,h)[c + 1] = qp.y;
             }
@@ -3198,6 +3579,9 @@ void main() {
 #define NR_QKVA(m, r) qkv[m][r]
 #else
     NR_OPB        yq[NR_MF][NR_CF];     // the quantised value, for QKV
+#if NR_V_SWAP
+    NR_OPA        yqa[NR_MF][NR_CF];    // The same bytes as V's A operand
+#endif
 #define NR_YN n
 #define NR_QKV_SRC(m, k) yq[m][k]
 #define NR_QKVA(m, r) qkv[r]
@@ -3406,6 +3790,9 @@ void main() {
             for (int c=0;c<8;c+=2) {
                 NR_QPAIR_T q=NR_QP_YQ(f16vec2(requantized[c],requantized[c+1]));
                 NR_YQ(m, n)[c]=q.x; NR_YQ(m, n)[c+1]=q.y;
+#if NR_V_SWAP && !NR_HWAVES
+                yqa[m][NR_YN][c]=q.x; yqa[m][NR_YN][c+1]=q.y;
+#endif
             }
         }
 #else
@@ -3460,6 +3847,9 @@ void main() {
 #endif
 #if NR_K_REGS
         NR_QK_OPA kreg[NR_MF][NR_DF];
+#endif
+#if NR_V_REGS
+        NR_PV_OPA vreg[NR_DF][NR_MF];
 #endif
         const NR_F16 hscale = NR_F16(wgt_f32[pc.s_off + uint(hh)]);
         NR_QK_OPB qb[NR_MF][NR_DF];
@@ -3685,6 +4075,25 @@ void main() {
             for (int m = 0; m < NR_MF; ++m)
                 for (int d = 0; d < NR_DF; ++d) acc[m][d] = NR_ACCZERO;
             for (int k = 0; k < NR_CF; ++k) {
+#if NR_V_SWAP
+#if !(NR_HWAVES && NR_ACC_F16 == 0 && defined(NR_PACKED_QKV) && NR_QUANT_PAIRED && NR_MF == NR_JF)
+#error "NR_V_SWAP: head-split FP32 packed-QKV body with one wave per window"
+#endif
+                // V = X . Wv^T, rows tokens - the same bytes read as the
+                // other operand (A RowMajor and B ColumnMajor touch the same
+                // addresses), so the accumulator comes out [token][dim], which
+                // is the context product's V^T A operand component for component.
+                NR_FRAG_A yka[NR_MF];
+                for (int m = 0; m < NR_MF; ++m)
+                    NR_LOAD_A(yka[m], lds_x, NR_LXB_
+                              uint(m * NR_CF + k) * 256u + NR_OPQ(130u), 16u);
+                for(int r=0;r<NR_DF;r+=2) {
+                    NR_FRAG_B wb0,wb1;
+                    NR_WEIGHT_PAIR(wb0,wb1,pc.qkv_off,uint(hh*3*NR_DF+2*NR_DF+r),uint(k),uint(NR_CF))
+                    for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(acc[m][r],yka[m],wb0);
+                    for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(acc[m][r+1],yka[m],wb1);
+                }
+#else
                 NR_FRAG_B yk[NR_MF];
                 for (int m = 0; m < NR_MF; ++m)
                     NR_LOAD_B(yk[m], lds_x, NR_LXB_
@@ -3709,10 +4118,22 @@ void main() {
                     for (int m = 0; m < NR_MF; ++m) NR_MMA(acc[m][r], wf, yk[m]);
                 }
 #endif
+#endif
                 if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
                     for (int m = 0; m < NR_MF; ++m)
                         for (int r = 0; r < NR_DF; ++r) NR_RND(acc[m][r])
             }
+#if NR_V_SWAP
+            for (int m = 0; m < NR_MF; ++m) NR_MG(m)
+                for (int d = 0; d < NR_DF; ++d)
+                    for (int c = 0; c < 8; c += 2) {
+                        fe4m3vec2 qp = nr_quant_pair(NR_N2_V(
+                            acc[m][d][c],
+                            acc[m][d][c + 1]));
+                        vreg[d][m][c] = qp.x;
+                        vreg[d][m][c + 1] = qp.y;
+                    }
+#else
             for (int m = 0; m < NR_MF; ++m) NR_MG(m)
                 for (int d = 0; d < NR_DF; ++d) {
                     NR_FRAG_E4M3 vf;
@@ -3730,6 +4151,7 @@ void main() {
                     NR_STORE_ACC_COL(vf, lds_y, NR_LXB_
                                      uint(m * NR_CF + hh * NR_DF + d) * 256u, 16u);
                 }
+#endif
         }
 #else
         for (int m = 0; m < NR_MF; ++m) {
@@ -3752,6 +4174,18 @@ void main() {
                     NR_WPF_STEP(wpq, k * 3 * NR_DF + r, NR_WPF_Q_TOT, NR_WPF_Q_ADDR)
 #define NR_WPF_WF_Q NR_WPF_AT(wpq, k * 3 * NR_DF + r)
 #else
+#if NR_V_SWAP
+#if NR_HWAVES || NR_WPF || !(NR_ACC_F16 == 0 && NR_QUANT_PAIRED)
+#error "NR_V_SWAP (window body): FP32, paired quantiser, no NR_WPF"
+#endif
+                    if (r >= 2 * NR_DF) {
+                        // V = X . Wv^T, rows tokens (see the head-split pass V).
+                        NR_OPB wfb;
+                        NR_C32_WEIGHT(wfb,pc.qkv_off,uint(hh*3*NR_DF+r),uint(k),uint(NR_CF));
+                        NR_MMA(qkv[r], yqa[m][k], wfb);
+                        continue;
+                    }
+#endif
                     NR_OPA wf;
                     NR_C32_WEIGHT(wf,pc.qkv_off,uint(hh*3*NR_DF+r),uint(k),uint(NR_CF));
 #define NR_WPF_WF_Q wf
@@ -3970,8 +4404,13 @@ void main() {
                     NR_PV_QT qp = NR_QP_V(NR_N2_V(
                         NR_QKVA(m, 2 * NR_DF + d)[c],
                         NR_QKVA(m, 2 * NR_DF + d)[c + 1]));
+#if NR_V_REGS && !NR_HWAVES
+                    vreg[d][m][c] = qp.x;
+                    vreg[d][m][c + 1] = qp.y;
+#else
                     vf[c] = qp.x;
                     vf[c + 1] = qp.y;
+#endif
                 }
 #else
                 for (int c = 0; c < 8; ++c)
@@ -3984,7 +4423,9 @@ void main() {
                 // product wants. Nothing crosses a wave, so no barrier.
                 NR_STORE_ACC_COL(vf, lds_y, NR_LXB_
                                  uint(m * NR_CF + hh * NR_DF + d) * 256u, 16u);
-#else
+#elif NR_V_SWAP && !NR_V_REGS
+                NR_STORE_ACC_COL(vf, lds_v, NR_V_LDS_OFFSET + uint(d) * 16u * uint(NR_WIN) + t0, uint(NR_WIN));
+#elif !NR_V_SWAP
                 NR_STORE_ACC(vf, lds_v, NR_V_LDS_OFFSET + uint(d) * 16u * uint(NR_WIN) + t0, uint(NR_WIN));
 #endif
             }
@@ -4268,7 +4709,9 @@ void main() {
             for (int m = 0; m < NR_MF; ++m) a[m] = NR_ACCZERO;
             for (int j = 0; j < NR_JF; ++j) {
                 NR_PV_OPA vf;
-#if NR_HWAVES
+#if NR_V_REGS
+                vf = vreg[e][j];
+#elif NR_HWAVES
                 NR_LOAD_A_COL(vf, lds_y, NR_LXB_
                               uint(j * NR_CF + hh * NR_DF + e) * 256u
                               + NR_OPQ(192u), 16u);
@@ -4342,7 +4785,7 @@ void main() {
     // the original's channel order. `nr_io_lo` picks which of the pair a lane
     // owns; the token it lands on is `tok0 + 2p*16 + lane` for both halves.
     const bool nr_io_lo = lane < 16u;
-    const uint nr_io_wp = pc.image_w_off >> 1u;
+    const uint nr_io_wp = NR_IMG_WOFF >> 1u;
     vec3 nr_io_o[NR_MF / 2];
     for (int p = 0; p < NR_MF / 2; ++p) nr_io_o[p] = vec3(0.0);
 #ifdef NR_TEMPORAL_HISTORY
@@ -4352,9 +4795,15 @@ void main() {
 // Two channels a step, exactly `image_w_off`'s uint pairing, so the weights and
 // the summation sequence are the ones the LDS form used.
 #ifdef NR_TEMPORAL_HISTORY
+#if NR_IO_DOT2
+#define NR_IO_W3(p_, ci_) { \
+        const f16vec2 ww=unpackFloat2x16(wgt_u32[nr_io_wp+48u+(ci_)]); \
+        nr_io_ow[p_]=nr_fdot2mix(av, ww, nr_io_ow[p_]); }
+#else
 #define NR_IO_W3(p_, ci_) { \
         const f16vec2 ww=unpackFloat2x16(wgt_u32[nr_io_wp+48u+(ci_)]); \
         nr_io_ow[p_]+=nr_io_a*float(ww.x); nr_io_ow[p_]+=nr_io_a1*float(ww.y); }
+#endif
 #else
 #define NR_IO_W3(p_, ci_) {}
 #endif
@@ -4364,6 +4813,17 @@ void main() {
 // `float(f16) * float(f16)` exactly as the LDS form did. That shape matters:
 // widening the activation before the select breaks the f16-source pattern ACO
 // contracts, and the picture moves by one code on 0.4% of channel samples.
+#if NR_IO_DOT2
+#define NR_IO_ACC(p_, ci_, u_) { \
+        const f16vec2 av=unpackFloat2x16(u_); \
+        const f16vec2 wx=unpackFloat2x16(wgt_u32[nr_io_wp+(ci_)]); \
+        const f16vec2 wy=unpackFloat2x16(wgt_u32[nr_io_wp+16u+(ci_)]); \
+        const f16vec2 wz=unpackFloat2x16(wgt_u32[nr_io_wp+32u+(ci_)]); \
+        nr_io_o[p_].x=nr_fdot2mix(av, wx, nr_io_o[p_].x); \
+        nr_io_o[p_].y=nr_fdot2mix(av, wy, nr_io_o[p_].y); \
+        nr_io_o[p_].z=nr_fdot2mix(av, wz, nr_io_o[p_].z); \
+        NR_IO_W3(p_, ci_) }
+#else
 #define NR_IO_ACC(p_, ci_, u_) { \
         const f16vec2 av=unpackFloat2x16(u_); \
         const float nr_io_a=float(av.x), nr_io_a1=float(av.y); \
@@ -4374,6 +4834,7 @@ void main() {
         nr_io_o[p_].y+=nr_io_a*float(wy.x); nr_io_o[p_].y+=nr_io_a1*float(wy.y); \
         nr_io_o[p_].z+=nr_io_a*float(wz.x); nr_io_o[p_].z+=nr_io_a1*float(wz.y); \
         NR_IO_W3(p_, ci_) }
+#endif
 #endif
 #if NR_WPF
     // Flat over (n, k): NR_CF * NR_CF weight tiles of the output projection.
@@ -4611,8 +5072,12 @@ void main() {
             // wave-uniform tx/ty alone: px>=0 <=> tx>=0, px<4W <=> tx<2W,
             // px/4 = tx>>1, px%4 = 2*(tx&1) + lx. The same store, addressed in
             // SALU plus one lane constant instead of ~14 VALU per fragment.
+#if NR_PRE_FULL & 4
+            const bool store_pool=(lane&5u)==0u;
+#else
             const bool store_pool=(lane&5u)==0u && tx>=0 && ty>=0 &&
                 tx<int(pc.pool_tiles_x*2u) && ty<int(pc.pool_tiles_y*2u);
+#endif
 #else
             const bool store_pool=(lane&5u)==0u && px>=0 && py>=0 &&
                 px<int(pc.pool_tiles_x*4u) && py<int(pc.pool_tiles_y*4u);
@@ -4839,10 +5304,21 @@ void main() {
                              + (((sdy / 4u) * pc.ds_otx + sdx / 4u) * (pc.ds_n / 16u) + dst_group) * 256u
                              + (4u * (sdy % 4u) + sdx % 4u) * 16u + col0) / 4u;
             if (in_grid && !s_oob) {
+#if NR_DS_QPAIR
+                // The same per-component mode-4 conversion, two at a time
+                // (one v_cvt_pk_fp8_f32 a pair instead of one a value + perms).
+                const fe4m3vec2 q0 = nr_quant_pair(f16vec2(outv[0], outv[1]));
+                const fe4m3vec2 q1 = nr_quant_pair(f16vec2(outv[2], outv[3]));
+                const fe4m3vec2 q2 = nr_quant_pair(f16vec2(outv[4], outv[5]));
+                const fe4m3vec2 q3 = nr_quant_pair(f16vec2(outv[6], outv[7]));
+                act_e4m3x4[ob]      = fe4m3vec4(q0.x, q0.y, q1.x, q1.y);
+                act_e4m3x4[ob + 1u] = fe4m3vec4(q2.x, q2.y, q3.x, q3.y);
+#else
                 act_e4m3x4[ob]      = fe4m3vec4(nr_quant_e4m3(outv[0]), nr_quant_e4m3(outv[1]),
                                                 nr_quant_e4m3(outv[2]), nr_quant_e4m3(outv[3]));
                 act_e4m3x4[ob + 1u] = fe4m3vec4(nr_quant_e4m3(outv[4]), nr_quant_e4m3(outv[5]),
                                                 nr_quant_e4m3(outv[6]), nr_quant_e4m3(outv[7]));
+#endif
             }
         }
     }
@@ -4865,16 +5341,23 @@ void main() {
             if (c != 0xFFFFFFFFu) {
                 const uint need = wgt_u32[pcp.df_off + c];
                 const uint old = atomicAdd(nr_sync[pcp.sync_off + 4u + c], 1u);
-                if (old + 1u == need * nr_epoch) {
-                    const uint pos = atomicAdd(nr_sync[nr_tail], 1u);
-                    atomicExchange(nr_sync[nr_qbase + pos], nr_tag | c);
-                }
+                if (old + 1u == need * nr_epoch) NR_ENQUEUE(c)
             }
         }
 #else
         if (tid == 0u) atomicExchange(nr_sync[nr_flag + nr_w], nr_epoch);
 #endif
         NR_PROF_ITEM_END(pcp.sync_off | 0x80000000u, nr_item)
+#if NR_PERSIST_ONE
+        // One workgroup per item when the host launches one per item (small
+        // C=256 grids): launch order is then claim order, so oldest-first wave
+        // arbitration runs the earliest-claimed - most upstream - items first.
+        // A persistent workgroup keeps its age for the whole run, and one that
+        // launched last on its CU runs whatever it claims several times slower,
+        // on the run's critical chain (C=128 at 1080p: layer-0 items ending
+        // after 330 us against ~20).
+        if (gl_NumWorkGroups.x >= pcp.total_windows) break;
+#endif
         barrier();                  // the next window reuses every LDS array
 #ifndef NR_FAIR
 #define NR_FAIR 0
@@ -4923,6 +5406,10 @@ void main() {
             atomicExchange(nr_sync[pcp.sync_off + 1u], 0u);
 #if NR_PERSIST_DF
             atomicExchange(nr_sync[nr_tail], 0u);
+#if NR_STRAG
+            atomicExchange(nr_sync[nr_chead], 0u);
+            atomicExchange(nr_sync[nr_ctail], 0u);
+#endif
 #endif
             atomicExchange(nr_sync[pcp.sync_off + 2u], nr_epoch);
         }
@@ -4974,7 +5461,7 @@ void main() {
     // accumulation order is unchanged - each product is still added to its own
     // `o` component in channel order - so this is the same arithmetic; only
     // where the weights live changes. See the WgtU32 alias above.
-    const uint wpair=pc.image_w_off>>1u;
+    const uint wpair=NR_IMG_WOFF>>1u;
     for(uint c=0u;c<32u;c+=2u) {
         const float a=float(image_features[token*32u+c]);
         const float a1=float(image_features[token*32u+c+1u]);
@@ -4994,7 +5481,14 @@ void main() {
     }
 #endif
     const vec2 uv=(vec2(pixel)+0.5)/vec2(textureSize(nr_src,0));
+#if NR_POST_ALPHA
+    // One fetch for the base colour and, when the alpha is restored, its alpha:
+    // uv is the texel centre, so this is the texel texelFetch would return.
+    const vec4 nr_base4=textureLod(nr_src,uv,0.0);
+    const vec3 base=nr_base4.rgb;
+#else
     const vec3 base=textureLod(nr_src,uv,0.0).rgb;
+#endif
     vec3 rgb=clamp(base+o*0.25,vec3(0.0),vec3(1.0));
 #ifdef NR_TEMPORAL_HISTORY
     // The original's temporal blend, gated by the same host-resolved term the
@@ -5060,11 +5554,35 @@ void main() {
     if (rgb.x == pc.image_intensity * 1234.5)   // diagnostic: never true at runtime
 #endif
 #if NR_DIAG_POSTSTORE != 2
+#if NR_POST_ALPHA
+    {
+        // linux/shaders/passes/runtime_alpha.comp's arithmetic. Its rounding is
+        // floor(p + 0.5) / 255 with p = clamp(x) * 255 rounded on its own, which
+        // it keeps unfused with `precise`. Here `precise` would propagate back
+        // into the whole projection and unfuse ACO's v_fma_mix (a different
+        // picture), so the same number is spelled without an add after the
+        // multiply: p <= 255, so p + 0.5 is exact and its floor is
+        // floor(p) + (fract(p) >= 0.5).
+        vec4 nr_o0=vec4(rgb,1.0);
+        if((pc.image_w_off&0x80000000u)!=0u) {
+            vec3 nr_r=rgb;
+            if((pc.image_w_off&0x40000000u)!=0u) {
+                const vec3 nr_p=clamp(nr_r,vec3(0),vec3(1))*255.0;
+                nr_r=(floor(nr_p)+step(vec3(0.5),fract(nr_p)))/255.0;
+            }
+            nr_o0=vec4(nr_r,nr_base4.a);
+        }
+        imageStore(nr_out0,pixel,nr_o0);
+    }
+#else
     imageStore(nr_out0,pixel,vec4(rgb,1.0));
+#endif
 #endif
 #ifdef NR_TEMPORAL_HISTORY
     imageStore(nr_out1,pixel,network);
-#elif NR_DIAG_POSTSTORE == 0
+#elif NR_DIAG_POSTSTORE == 0 && !NR_POST_NO_OUT1
+    // NR_POST_NO_OUT1: nothing reads this copy of the answer - every consumer
+    // takes surf0, and the temporal variant writes its own history above.
     imageStore(nr_out1,pixel,vec4(rgb,1.0));
 #endif
     }
@@ -5075,6 +5593,20 @@ void main() {
     // the whole shader - with only the first, NIR overlaps it with the real
     // arrays and the allocation does not grow (LDS size 32768 at any pad).
     if (NR_COH_NEVER) act_e4m3[1] = act_e4m3[nr_lds_pad[gl_LocalInvocationID.x ^ 3u]];
+#endif
+#if NR_IMAGE && (NR_PRE_FULL & 16)
+    // diagnostic (poisons the output): a window with any out-of-range tile
+    // writes e4m3 NaN over its first output byte after its own stores.
+    {
+        bool nr_any = false;
+        for (uint q = 0u; q < 4u; ++q) nr_any = nr_any || nr_tile_oob(q);
+#if NR_PRE_FULL & 32
+        nr_any = nr_any || (nr_wx == 7u && nr_wy == 5u);   // proves the poison reaches the picture
+#endif
+        barrier();
+        if (nr_any && gl_LocalInvocationIndex == 0u)
+            act_e4m3[pc.o_off + nr_tile_base(0u)] = NR_E4M3(uintBitsToFloat(0x7fc00000u));
+    }
 #endif
 #ifdef NR_PROF_OFF
 #if NR_PERSIST

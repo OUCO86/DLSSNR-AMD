@@ -218,14 +218,13 @@ if ($Route -eq 'optiscaler') {
     # split DLL: the game's calls go to DXVK's dxgi (dxgi-dxvk.dll), the graphics driver's own presentation calls to the system DXGI.
     Put-File (Join-Path $here 'optiscaler\game\OptiScaler.dll') 'dxgi.dll'
     Put-File (Join-Path $here 'dxvk\dxgi.dll') 'dxgi-dxvk.dll'
-    foreach ($f in '_nvngx.dll', 'nvngx.dll_dlssnr.dll', 'nvngx_dlssnr.dll', 'dxgi-original.dll') { Put-File (Join-Path $here "optiscaler\$f") $f }
+    foreach ($f in 'dlssnr_core.dll', 'nvngx.dll_dlssnr.dll', 'nvngx_dlssnr.dll', 'dxgi-original.dll') { Put-File (Join-Path $here "optiscaler\$f") $f }
     Record-Logs @('OptiScaler.log')
 
     $ini = Join-Path $game 'OptiScaler.ini'
     $wanted = [ordered]@{
         'DlssNr|Enabled'               = 'true'
-        'Libraries|NvngxPath'          = (Join-Path $game '_nvngx.dll')
-        'Spoofing|StreamlineSpoofing'  = 'true'
+        'Libraries|NvngxPath'          = (Join-Path $game 'dlssnr_core.dll')
         # Auto picks FSR4 on RX 9000, which goes through the AMD driver's own D3D12 extension and does not work on vkd3d-proton.
         'Upscalers|Dx12Upscaler'       = 'xess'
         # With DXVK, overlays such as Steam's load while DXVK creates its Vulkan instance; OptiScaler then

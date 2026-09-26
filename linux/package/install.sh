@@ -120,7 +120,7 @@ case "$route" in
             if [[ -d "$f" ]]; then put_tree "$f" "$name"; else put_file "$f" "$name"; fi
         done
         rm -rf -- "$tmp"
-        for f in nvngx.dll_dlssnr.dll nvngx_dlssnr.dll _nvngx.dll; do put_file "$here/optiscaler/$f" "$f"; done
+        for f in nvngx.dll_dlssnr.dll nvngx_dlssnr.dll dlssnr_core.dll; do put_file "$here/optiscaler/$f" "$f"; done
         python3 "$here/optiscaler/patch_ini.py" "$game"
         record OptiScaler.log; record dlssnr-amd.log
         overrides="dxgi=n,b"

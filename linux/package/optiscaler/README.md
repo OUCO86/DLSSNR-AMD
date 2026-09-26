@@ -32,7 +32,7 @@ list with `GetModuleHandleW` (never `LoadLibrary`) and routes through its export
 | `dxgi.dll` | OptiScaler itself, renamed | the release archive, renamed as its own `setup_linux.sh` would |
 | `OptiScaler.ini` | its configuration | the release archive, four keys rewritten (below) |
 | `OptiScaler/`, `docs/`, `Licenses/` | its FSR/XeSS libraries and papers | the release archive, untouched |
-| **`_nvngx.dll`** | **the NGX core, and feature 18** | `linux/build/build_optiscaler_nr.sh` |
+| **`dlssnr_core.dll`** | **the NGX core, and feature 18** (built as `_nvngx.dll`, shipped renamed; below) | `linux/build/build_optiscaler_nr.sh` |
 | **`nvngx.dll_dlssnr.dll`** | **the forwarder, for the older lineage** | same |
 | **`nvngx_dlssnr.dll`** | **a byte copy of the forwarder** | same |
 | `build/`, `artifacts/` | the network's SPIR-V and its ~290 MB of weights | `linux/build/build_package.sh`'s package |
@@ -59,7 +59,16 @@ line telling users to delete it. Set `NR_OPTI_ZIP=` to bundle the other lineage 
 
 ## Why three DLLs and not one
 
-**`_nvngx.dll`** is the one that matters now. It has two jobs.
+**The NGX core** (built as `_nvngx.dll`, installed as `dlssnr_core.dll`) is the one that matters now.
+
+It is not installed under NVIDIA's name. A Streamline game (007 First Light) initialises NGX itself,
+and a module called `_nvngx.dll` already loaded in the process -- ours, loaded early through
+`NvngxPath` -- is taken for NVIDIA's core: Streamline's NGX start fails (`ngxResult failed
+0xbad00002`, "Missing NGX context") and the game greys out DLSS. Unmodified OptiScaler has no such
+module, so Streamline's attempt to load the core reaches OptiScaler's own hook and DLSS stays
+selectable. Renamed, ours no longer stands in the way, and the DLSS option is back.
+
+It has two jobs.
 
 *The parameter block.* Every fork needs one and will only take the core's capability block:
 `NVNGXProxy::InitDx12(device)` and then `D3D12_GetCapabilityParameters()`, and it gives up if either
@@ -125,7 +134,7 @@ time a second handle appears.
 
 ## The ini keys, and the one that is deliberately left alone
 
-Written by the installer into the archive's own `OptiScaler.ini`. All four ship as `<key>=auto` in
+Written by the installer into the archive's own `OptiScaler.ini`. Both ship as `<key>=auto` in
 v0.8.4 and are rewritten in place; a key that has been renamed upstream shows up as an error rather
 than as a silently ignored line.
 
@@ -134,27 +143,61 @@ than as a silently ignored line.
 Enabled=true
 
 [Libraries]
-NvngxPath=<game-dir>\_nvngx.dll
-
-[Spoofing]
-Dxgi=true
-StreamlineSpoofing=true
+NvngxPath=<game-dir>\dlssnr_core.dll
 ```
 
 - `[DlssNr] Enabled` — the key name is `Enabled` inside section `DlssNr`, not `DlssNrEnabled`
   (`Config.cpp`: `readBool("DlssNr", "Enabled")`). Default (auto) is `false`.
 - `[Libraries] NvngxPath` — `Util::LoadProxyLibrary` accepts a directory (it appends `_nvngx.dll`,
-  the first of the two names it tries) or a full file path. The file path is written so there is no
-  ambiguity about which name it picks up.
-- `[Spoofing] Dxgi` already defaults to true on an AMD card ("Default (auto) is true for AMD/Intel"),
-  and `SpoofedVendorId` / `SpoofedDeviceId` already default to NVIDIA and a 4090. They are written
-  out explicitly only so an inherited ini cannot have turned them off.
+  the first of the two names it tries) or a full file path. A file path is written, and it names
+  `dlssnr_core.dll`, never `_nvngx.dll` (see "Why three DLLs").
+- `[Spoofing]` stays at the release's `auto` values: `StreamlineSpoofing` is true, `Dxgi` is true on
+  an AMD card, and the GPU reported to the game is an NVIDIA RTX 4090 (`SpoofedVendorId` 0x10de,
+  `SpoofedDeviceId` 0x2684), which is what makes a game offer DLSS at all. `Dxgi` depends on the game
+  and the system: if the NR page stays at "Waiting for the upscaler to run", try `Dxgi=false`
+  (Dying Light: The Beast has needed it). The package README and install.sh give the same advice.
 - **`[DlssNr] RunBeforeSR` is left at the release default** (`auto`, which is `false`): NR runs after
   the upscaler, where the official pipeline puts it. It is a live control in OptiScaler's own overlay
   and choosing it here would override a decision that is the user's.
 - **`[Upscalers] Dx12Upscaler` is left at `auto` on purpose.** Left alone it picks FSR4 on a capable
   Radeon and XeSS otherwise, which is OptiScaler's own choice; pinning it here would override a
   decision that has nothing to do with Neural Rendering.
+
+## Fixes applied to OptiScaler in memory
+
+OptiScaler itself is shipped as released and never rebuilt. The NGX core corrects five defects of
+OptiScaler-NR v0.8.4 in memory when OptiScaler loads it, before the game creates a Vulkan device or
+presents (`linux/src/pe/nr_pe_optifix.cpp`). Each is found by exact byte signatures; another
+OptiScaler build is left untouched and `dlssnr-amd.log` says so. `NR_OPTISCALER_FIX=0` turns all off.
+
+- **Startup abort (007 First Light).** The fork's `vkCreateDevice` hook queries device extensions
+  through `vkGetInstanceProcAddr` on the most recently *created* VkInstance, which it never forgets
+  when that instance is destroyed. A game that creates and destroys several instances at startup
+  (Streamline, AMD AGS, DXVK/vkd3d factories) reaches the next device with a dead handle, and the
+  Linux loader aborts the process ("vkGetInstanceProcAddr: Invalid instance") before a window opens.
+  The query now passes a null instance, which returns no function; that hook then adds no extension
+  (on a Radeon it only ever added a name DXVK and vkd3d-proton already use as Vulkan 1.3 core).
+- **Finished Picture under DXVK / vkd3d-proton.** OptiScaler's Present wrapper returns early when the
+  GPU runs DXVK, before the call that applies NR to the finished picture, so `[DlssNr]
+  FinishedPicture=true` never ran under Proton (status "Waiting for the previous picture to
+  finish.", NR off). The DXVK path now makes the same call under the same condition before its
+  Present; nothing else on that path changes.
+- **A 0 x 0 (window-sized) swapchain taken for an overlay (Helldivers 2).** `CreateSwapChainForHwnd`
+  treats any width or height under 100 as an overlay and never wraps it, so NR never became ready. A
+  zero, which DXGI defines as "the window's size", now takes the normal path; 1..99 still count as an
+  overlay.
+- **A D24S8 depth guide copied into an R24X8 texture (Helldivers 2, Kingdom Come: Deliverance II).**
+  vkd3d-proton makes D24S8 a D32S8 image on AMD, and the copy into an R24X8 clone hung the GPU
+  (amdgpu reset). The guide is now passed on in its own format; the NR runtime reads the depth aspect
+  of depth/stencil images (`linux/shaders/passes/runtime_depth.comp`).
+- **A float colour with AutoExposure but no HDR flag (007 First Light, Helldivers 2).** OptiScaler
+  treated it as finished SDR and handed NR raw scene-linear values (up to 563 in Helldivers 2). It is
+  now encoded as linear HDR, the same as a game that sets the HDR flag.
+
+007 First Light is still not right before or after SR: it declares AutoExposure and hands over no
+exposure, so OptiScaler's encode falls back to a fixed white point (paper white 1.0) and the model
+sees a frame about five stops too dark (mean 0.028 against 0.2-0.4 for its finished picture). The
+same happens through the game's DLSS or FSR path. Finished Picture is correct there.
 
 ## What the core does not do
 
@@ -180,7 +223,7 @@ deliberate on their side and we do not fight it.
 `docs/NR-INITIALIZATION-DIAGNOSTICS.md` in the release describes `NgxDiagnostics::RuntimeReport`,
 which runs before and after `CreateFeature(18)` with `[Log] LogLevel=2`. It **queries the core for
 nothing**: it logs the device and command-list LUIDs, `GetDeviceRemovedReason`, `GetNodeCount`, the
-path/size/version of the loaded dispatcher (our `_nvngx.dll` — it has no VERSIONINFO resource, so that
+path/size/version of the loaded dispatcher (our `dlssnr_core.dll` — it has no VERSIONINFO resource, so that
 field reads `unknown`), the size and SHA-256 of every `nvngx_dlssnr.dll` candidate it can find, and
 whether a module by that name is in the process list. On our path it is not, so it always logs
 `nvngx_dlssnr.dll is not present in the process module list` — a log line with no effect on behaviour.

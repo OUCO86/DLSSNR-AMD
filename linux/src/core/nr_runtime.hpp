@@ -122,6 +122,10 @@ struct ColourFrame {
     VkAccessFlags before_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     VkPipelineStageFlags after_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkAccessFlags after_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    // What the image may be used for, when the caller knows. Zero = unknown.
+    // With VK_IMAGE_USAGE_SAMPLED_BIT the engine path samples the colour and
+    // depth in place instead of copying them (same values, no copy).
+    VkImageUsageFlags usage = 0;
 };
 
 // Explicit engine/integration-provided mask. Linear RGBA32F, TRANSFER_SRC,

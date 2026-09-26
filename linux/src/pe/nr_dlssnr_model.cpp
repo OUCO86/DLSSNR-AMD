@@ -357,6 +357,35 @@ int debug_skip_pass() {
     return k;
 }
 
+// NR_DEBUG_NOOP=1: every D3D12 evaluate returns at once - no seed copy, no barrier, nothing
+// recorded - so a fault that remains is in the caller's own work around the call, not in ours.
+bool debug_noop() {
+    static const bool k = [] {
+        char v[8] = {};
+        const DWORD n = GetEnvironmentVariableA("NR_DEBUG_NOOP", v, sizeof v);
+        const bool on = n > 0 && v[0] == '1';
+        if (on) log("[nr] NR_DEBUG_NOOP=1: D3D12 evaluates record nothing at all");
+        return on;
+    }();
+    return k;
+}
+
+// NR_DEBUG_DEPTH=off: the depth guide is not handed on, so the motion vector is read at the pixel
+// itself; NR_DEBUG_DEPTH=flip: the caller's DepthInverted is taken the other way round. For telling a
+// depth-related artefact from one that has nothing to do with depth, in the same build.
+enum class DebugDepth { Normal, Off, Flip };
+DebugDepth debug_depth() {
+    static const DebugDepth k = [] {
+        char v[8] = {};
+        const DWORD n = GetEnvironmentVariableA("NR_DEBUG_DEPTH", v, sizeof v);
+        const std::string s = n > 0 && n < sizeof v ? std::string(v, n) : std::string();
+        if (s == "off") { log("[nr] NR_DEBUG_DEPTH=off: the depth guide is not used"); return DebugDepth::Off; }
+        if (s == "flip") { log("[nr] NR_DEBUG_DEPTH=flip: DepthInverted is taken the other way round"); return DebugDepth::Flip; }
+        return DebugDepth::Normal;
+    }();
+    return k;
+}
+
 // Live D3D12 features in creation order, for the pass number above only.
 std::vector<Feature*> g_live_d3d12;
 
@@ -437,6 +466,8 @@ struct ReadbackStats {
     double mean_abs[3] = {0, 0, 0};
     double changed = 0;    // fraction, 0..1
     double max_abs = 0;
+    double in_max = 0;       // largest input channel: a float frame can exceed 1.0, an 8-bit one cannot
+    uint64_t in_over1 = 0;   // samples with any input channel above 1.0
     uint64_t samples = 0;
     uint64_t nonfinite = 0;
 };
@@ -715,6 +746,9 @@ bool readback_drain(DebugReadback& rb, uint64_t feature_id) {
             for (int k = 0; k < 3; ++k)
                 if (!std::isfinite(ci[k]) || !std::isfinite(co[k])) finite = false;
             if (!finite) { ++s.nonfinite; continue; }
+            const double cmax = std::max({double(ci[0]), double(ci[1]), double(ci[2])});
+            if (cmax > s.in_max) s.in_max = cmax;
+            if (cmax > 1.0) ++s.in_over1;
             s.in_luma += luma_of(ci);
             s.out_luma += luma_of(co);
             double biggest = 0;
@@ -753,6 +787,9 @@ void readback_log(const Feature* f, DebugReadback& rb) {
         "max %.5f",
         static_cast<unsigned>(f->id), static_cast<unsigned>(rb.stats_n), s.in_luma, s.out_luma,
         s.mean_abs[0], s.mean_abs[1], s.mean_abs[2], s.changed * 100.0, s.max_abs);
+    log("[nr] readback #%u (%u) input max %.4f, %.3f%% of samples above 1.0", static_cast<unsigned>(f->id),
+        static_cast<unsigned>(rb.stats_n), s.in_max,
+        s.samples ? 100.0 * double(s.in_over1) / double(s.samples) : 0.0);
     if (s.nonfinite)
         log("[nr] readback #%u (%u) %llu of %llu samples were not finite and were dropped",
             static_cast<unsigned>(f->id), static_cast<unsigned>(rb.stats_n),
@@ -901,6 +938,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         g_last_error = "invalid model feature or resources";
         return 0;   // the reference's "bad arguments" answer
     }
+    if (debug_noop()) return static_cast<int>(NVSDK_NGX_Result_Success);
 
     ID3D12Device* device = nullptr;
     if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || !device) {
@@ -949,7 +987,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // Both guides are OptiScaler's own clones, made readable by ReadableGuide and left in
     // NON_PIXEL_SHADER_RESOURCE for the call (DlssNr_Dx12.cpp lines 2440-2448 transition them back).
     resources.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    resources.depth = depth;
+    resources.depth = debug_depth() == DebugDepth::Off ? nullptr : depth;
     resources.depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     // The guide subrects, straight through. Depth takes the render extent, motion takes its own --
     // they differ whenever the game's motion vectors are at display resolution
@@ -958,7 +996,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // apply_guide_subrect.
     resources.depth_subrect = to_session(depth_rect);
     resources.motion_subrect = to_session(motion_rect);
-    resources.depth_inverted = depth_inverted != 0;
+    resources.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip);
     // The caller's flag and nothing else: every feature has its own history now.
     resources.reset = reset != 0;
     // Diagnostic (2026-09-16): NR_DEBUG_ALWAYS_RESET=1 suppresses history on every evaluate, to
@@ -977,6 +1015,12 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     // OptiScaler's DlssNr encode has already tone-mapped this proxy into the game's own format
     // (DlssNr_Dx12.cpp DispatchPass -> colorCopy), so a float format here is display-referred, not
     // scene-referred linear light, and the runtime must not encode it again.
+    //
+    // A float colour that reports no HDR but asks for AutoExposure (007 First Light, Helldivers 2) is
+    // scene-linear; OptiScaler now encodes it as linear HDR too (nr_pe_optifix.cpp, fix 5). What it
+    // cannot do is expose it: such a game hands over no exposure, the encode falls back to a fixed
+    // white point, and 007's frame reaches the network about five stops too dark. Re-encoding here
+    // would not help; the white point has to come from the frame, before the encode.
     resources.colour_encoded = true;
 
     write_evaluate_keys(params, controls, resources.reset, depth_inverted);
@@ -1209,8 +1253,10 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     const char* why = ran ? nullptr
                       : session.failed() ? "failed"
                       : session.building() ? "building" : "declined";
-    log_evaluate(f, "Vulkan", frame.width, frame.height, static_cast<const void*>(frame.colour),
-                 static_cast<const void*>(out_image), frame.reset, ran, why, session.gpu_ms());
+    // A C-style cast through uintptr_t: VkImage is a pointer on x86_64 and a
+    // uint64_t on i686, and static_cast is legal for only one of them.
+    log_evaluate(f, "Vulkan", frame.width, frame.height, (const void*)(uintptr_t)(frame.colour),
+                 (const void*)(uintptr_t)(out_image), frame.reset, ran, why, session.gpu_ms());
     if (!ran && !session.status().empty()) {
         g_last_error = session.status();
         static std::string reported;

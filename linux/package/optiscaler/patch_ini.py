@@ -31,16 +31,15 @@ def wanted_keys(game: str) -> dict:
         # The pass itself. Ships false; this is the whole point of the install.
         ("DlssNr", "Enabled"): "true",
         # Where NVNGXProxy looks for the NGX core. Util::LoadProxyLibrary takes either a directory (it
-        # appends _nvngx.dll, the first of the two names it tries) or a file path; the file path is
-        # written so there is no doubt which name it picks up.
-        ("Libraries", "NvngxPath"): windows_path(os.path.join(game, "_nvngx.dll")),
-        # Spoofing. [Spoofing] Dxgi already defaults to true on an AMD card ("Default (auto) is true
-        # for AMD/Intel") and SpoofedVendorId/SpoofedDeviceId already default to NVIDIA and a 4090.
-        # Written out only so an inherited ini cannot have turned them off.
-        # [Spoofing] Dxgi is left at the release's own `auto` on purpose: it is
-        # per game. Dying Light: The Beast only lets the NR pass run with it OFF
-        # (found 2026-09-16), other games need it ON to expose DLSS at all.
-        ("Spoofing", "StreamlineSpoofing"): "true",
+        # appends _nvngx.dll, the first of the two names it tries) or a file path. A file path, and
+        # not under NVIDIA's name: a loaded module called _nvngx.dll is what Streamline takes for
+        # NVIDIA's core, and ours offers no DLSS (see linux/build/build_package.sh).
+        ("Libraries", "NvngxPath"): windows_path(os.path.join(game, "dlssnr_core.dll")),
+        # [Spoofing] is left at the release's own `auto` values (StreamlineSpoofing: true; Dxgi: true
+        # on AMD/Intel; the reported GPU: an NVIDIA RTX 4090, so the game offers DLSS). Dxgi is a
+        # per-game, per-system setting: if the NR page stays at "Waiting for the upscaler to run",
+        # Dxgi=false is the thing to try (Dying Light: The Beast has needed it). The package
+        # README and install.sh say so.
         # [Upscalers] Dx12Upscaler is deliberately absent: left at auto it picks FSR4 on a capable
         # Radeon and XeSS otherwise, which is OptiScaler's own choice and has nothing to do with
         # Neural Rendering.

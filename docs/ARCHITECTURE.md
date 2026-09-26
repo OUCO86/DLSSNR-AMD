@@ -28,9 +28,13 @@ game's own command buffer, at the point where the frame is processed.
 
 **`optiscaler` route.** [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
 hooks the game's DLSS/FSR/XeSS upscaler, gathers colour, depth and the engine's own motion vectors,
-and calls NVIDIA's NGX API for feature 18 (DLSS-NR). This project provides that API: `_nvngx.dll`
-implements the NGX entry points and runs our network instead of NVIDIA's. OptiScaler itself is not
-modified. The motion vectors are the engine's own, not estimated as in the ReShade routes.
+and calls NVIDIA's NGX API for feature 18 (DLSS-NR). This project provides that API: an NGX core
+(`dlssnr_core.dll`, which OptiScaler loads through `[Libraries] NvngxPath`) implements the NGX entry
+points and runs our network instead of NVIDIA's. It is deliberately not named `_nvngx.dll`: Streamline
+games would take a loaded module of that name for NVIDIA's own core and lose their DLSS option.
+OptiScaler's file is not modified; a few defects of the bundled release are corrected in memory when
+it loads the core (`linux/src/pe/nr_pe_optifix.cpp`, listed in `linux/package/optiscaler/README.md`).
+The motion vectors and depth are the engine's own, not estimated as in the ReShade routes.
 
 **`reshade` route.** For games without an upscaler to hook, a ReShade add-on (the design follows
 [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder)) takes the back buffer, depth from

@@ -63,8 +63,8 @@ Use
 ---
 optiscaler: turn on DLSS in the game; Insert opens the OptiScaler menu, the NR settings are on
             the DLSS Neural Rendering page.
-            If the NR page keeps showing "Waiting for the upscaler to run", set
-            [Spoofing] Dxgi=false in OptiScaler.ini (Dying Light: The Beast needs this).
+            If the NR page keeps showing "Waiting for the upscaler to run", try
+            [Spoofing] Dxgi=false in OptiScaler.ini (Dying Light: The Beast has needed it).
 reshade / vulkan / dx9: Home opens ReShade, the settings are on the Add-ons page; the same
             settings are kept in dlssnr-amd.ini in the game folder and changes apply live.
 
@@ -74,6 +74,12 @@ Known issues
 ------------
 - 32-bit games at 4K may fail on the first launch (the 32-bit address space runs out while
   ReShade compiles its shaders for the first time); the second launch works.
+- 007 First Light (optiscaler route): with NR before or after the upscaler the picture turns
+  dark, green and grainy. The game leaves exposure to the upscaler and hands over none, so the
+  frame NR gets is far too dark. Either lower Paper white on the DLSS Neural Rendering page of
+  the OptiScaler menu (about 0.06; [DlssNr] WhitePointScale in OptiScaler.ini), or set
+  [DlssNr] FinishedPicture=true so NR works on the finished picture (the HUD is then processed
+  as well).
 
 Uninstall
 ---------
