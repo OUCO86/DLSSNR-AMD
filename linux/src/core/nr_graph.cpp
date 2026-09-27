@@ -37,6 +37,7 @@
 #include <sstream>
 #include <string>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 // The ViT GEMM's wide tile, `NR_MTILE`/`NR_NTILE` in gemm1x1.comp. It is a
@@ -59,11 +60,21 @@
 #ifndef NR_POST_ALPHA
 #define NR_POST_ALPHA 0
 #endif
+// The C=512 dispatches (attn, the projections on gemmprojc, ffwd3/ffwd3w) carry
+// tile counters (NR_TCHAIN=1 builds, manifest tchain): consecutive ones wait on
+// the token tiles they read instead of a barrier (see the NR_TCHAIN block).
+// NR_TCHAIN=0 in the environment keeps the barriers.
+#ifndef NR_TCHAIN_TILES
+#define NR_TCHAIN_TILES 0
+#endif
 // `ffwd3w` (ffwd3_t.comp NR_FFWD_FM=2: two 16-token tiles a subgroup, each weight
 // fragment feeding two MMAs) for C=512 layers of at least this many tokens; 0: never.
 // Fewer, heavier subgroups: 4K -14% a layer, 1080p +3%.
 // The subgroups of an ffwd3 workgroup share one weight group and take
 // consecutive token tiles (ffwd3_t.comp NR_FFWD_GMAJOR); must match the SPVs.
+#ifndef NR_GEMM_REMAP_HOST
+#define NR_GEMM_REMAP_HOST 0  // gemm1x1 NR_GEMM_REMAP_PC workgroup order; must match the SPVs
+#endif
 #ifndef NR_FFWD_GMAJOR
 #define NR_FFWD_GMAJOR 0
 #endif
@@ -130,12 +141,62 @@ static size_t g_prof_words = 0, g_prof_off = 0;  // NR_PROF
 static uint32_t g_chain_epoch_word = 0xFFFFFFFFu, g_chain_base = 0, g_chain_n = 0;  // NR_CHAIN
 static std::set<std::string> g_chain_kern;
 static std::vector<uint8_t> g_chain_nobar;
+// NR_TCHAIN: barriers replaced by tile counters; the counters and error words
+// (activation arena words from g_tc_base, zero-filled with the arena).
+static std::vector<uint8_t> g_tc_nobar;
+static std::vector<uint32_t> g_tc_words;
+static std::vector<size_t> g_tc_err;   // error words, as indices into g_tc_words
+static size_t g_tc_base = 0;
+static bool tchain_active() {
+    const char* e = std::getenv("NR_TCHAIN");
+    return NR_TCHAIN_TILES && !(e && *e && std::atoi(e) == 0) && g_chain_epoch_word != 0xFFFFFFFFu;
+}
+// Which barriers a tile counter replaces. C=512: attn -> its projection ->
+// ffwd3 -> FFN projection -> attn. ViT: expand -> contraction -> QKV, and
+// attention -> projection -> the next expand (QKV -> attention needs every
+// token and keeps its barrier). The arena layout probe asks before any offset
+// exists, so this looks only at the kernels; the build checks the data offsets.
+static bool tchain_pair(const std::string& p, const std::string& q) {
+    auto g = [](const std::string& k) { return k == "gemmprojc"; };
+    auto f = [](const std::string& k) { return k == "ffwd3" || k == "ffwd3w"; };
+    auto vp = [](const std::string& k) { return k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt"; };
+    auto up = [](const std::string& k) { return k == "fswinpup256" || k == "fswinpup128" || k == "fswinpup64"; };
+    static const uint32_t kinds = std::getenv("NR_TCHAIN_KINDS")   // diagnostic: bit per group below
+        ? uint32_t(std::strtoul(std::getenv("NR_TCHAIN_KINDS"), nullptr, 0)) : 0xFFu;
+    return ((kinds & 1) && ((p == "attn" && g(q)) || (g(p) && f(q)) || (f(p) && g(q)) || (g(p) && q == "attn"))) ||
+           ((kinds & 2) && p == "gemmvact" && vp(q)) || ((kinds & 4) && vp(p) && q == "gemmvqkvnorm") ||
+           ((kinds & 8) && p == "vitattn" && vp(q)) || ((kinds & 16) && vp(p) && q == "gemmvact") ||
+           // the decoder: C=512 -> the UPS-first C=256 run -> C=128 -> C=64 -> the C=32 fused upsample
+           ((kinds & 32) && ((g(p) && up(q)) || (up(p) && (up(q) || q == "fswinfusedup32")))) ||
+           // the encoder: each level's downsample -> the next level's DS-last run
+           ((kinds & 64) && ((p == "fswindsp32" && q == "fswinpds64") || (p == "fswinpds64" && q == "fswinpds128") ||
+                             (p == "fswinpds128" && q == "fswinpds256"))) ||
+           // the C=256 run's downsample -> the first C=512 FFN (needs the frame tick)
+           ((kinds & 128) && p == "fswinpds256" && f(q));
+}
+// The kernels built with NR_TCHAIN=1, which carry the five push words right
+// after their push block as this file declares it (gemm1x1 pipelines therefore
+// all build NR_GEMM_REMAP_PC=1, so their block ends with `remap` like PushGemm).
+static bool tchain_kern(const std::string& k) {
+    return k == "attn" || k == "gemmprojc" || k == "ffwd3" || k == "ffwd3w" || k == "gemmvact" ||
+           k == "gemmproj" || k == "gemmprojw" || k == "gemmprojt" || k == "gemmvqkvnorm" || k == "vitattn" ||
+           k == "fswinpup256" || k == "fswinpup128" || k == "fswinpup64" || k == "fswinfusedup32" ||
+           k == "fswinpds256" || k == "fswinpds128" || k == "fswinpds64" || k == "fswindsp32" || k == "fswin32";
+}
 #ifndef NR_PERSIST_DF
 #define NR_PERSIST_DF 0
 #endif
 // Fold the level's fused downsample (`fswindsp<C>`) into the persistent run
 // that precedes it, as the run's last layer (bit 1: C=64, 2: C=128, 4: C=256).
 // The fswinp<C> SPV must be built with NR_PERSIST_DS=1 for every set bit.
+// Shared arena: a slot smaller than NR_ARENA_COLD_MAX bytes only takes memory
+// freed at least NR_ARENA_COLD dispatches before its first one (see the reuse layout).
+#ifndef NR_ARENA_COLD
+#define NR_ARENA_COLD 1
+#endif
+#ifndef NR_ARENA_COLD_MAX
+#define NR_ARENA_COLD_MAX 8388608
+#endif
 #ifndef NR_PERSIST_DS_MASK
 #define NR_PERSIST_DS_MASK 0
 #endif
@@ -155,7 +216,9 @@ static std::vector<uint8_t> g_chain_nobar;
 // ViT's FFN contraction (K = 4096) at large token counts gets a second
 // projection pipeline, `gemmprojw`, with 64x64 wave tiles (one load VGPR per
 // WMMA instead of two). Same k order per output, so the same bytes. Below
-// NR_PROJW_MIN_TOKENS the 32x32 tile keeps more waves in flight and wins.
+// NR_PROJW_MIN_TOKENS the 32x32 tile keeps more waves in flight and wins
+// (with the remapped workgroup order: 640 tokens 25 vs 38 us, 960 tokens 44.7
+// vs 40.4 us, so the product sets 768).
 #ifndef NR_GEMM_PROJW_MT
 #define NR_GEMM_PROJW_MT 64
 #endif
@@ -711,6 +774,8 @@ struct PushGemm {
     uint32_t otx, raster, crow, rows, ds_raster, writer_rows;
     // C>=64 DS: the real pooled extent inside the padded view; zero outside it.
     uint32_t clear_x, clear_y;
+    // gemm1x1 NR_GEMM_REMAP_PC: workgroup order (0 = launch order).
+    uint32_t remap;
 };
 struct PushQkvNorm { uint32_t src, dst, tokens, scale_off; };
 struct PushDecoderUps { uint32_t src, skip, dst, gain_off, IW, OW, OH; };
@@ -948,6 +1013,16 @@ struct NrSession {
     uint32_t math_profile = 0;
     // Byte offsets of every merged run's error word, read back after a run.
     std::vector<uint32_t> persist_err;
+    // NR_TCHAIN, kept per session for the runtime's in-game check (nr_runtime.cpp
+    // Impl::Check; the g_tc_* globals belong to whichever build ran last): the
+    // counter region (arena words from tc_base), its error words, and every
+    // counter a table names with the units a frame adds to it - after n whole
+    // frames it holds need * n.
+    struct TcExpect { uint32_t word, need, pair; };
+    uint32_t tc_base = 0, tc_words = 0;
+    std::vector<uint32_t> tc_err;          // words in the region, one per chained pair
+    std::vector<TcExpect> tc_expect;       // word in the region, need, pair
+    std::vector<std::string> tc_pair;      // "producer -> consumer" per chained pair
     std::vector<const Step*> run;
     std::map<int, size_t> reader_tokens;   // block -> tokens of whoever reads it
     std::map<int, int> last_layer;   // block -> its final layer
@@ -960,7 +1035,18 @@ struct NrSession {
     int build(int argc, char** argv, const std::vector<Step>* prepared_plan = nullptr);
 };
 
+// The layout globals above (g_chain_*, g_tc_*) are one copy for every build, and
+// a game can build two networks at once (the D3D12 and the Vulkan session each
+// have a background build thread): one build at a time. A session keeps what it
+// needs of them (persist_err, tc_*), and recording reads only that. Recursive:
+// a build runs its arena-layout probe build on the same thread.
+static std::recursive_mutex g_build_lock;
+
 int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_plan) {
+    std::lock_guard<std::recursive_mutex> one_build(g_build_lock);
+    // A build lays out its own persistent sync words; an epoch word left from a
+    // previous build (another extent) would point into the old layout.
+    g_chain_epoch_word = 0xFFFFFFFFu;
     // Where the build's seconds go. Closed phase by phase and logged once at the
     // end through nr::logf, which is the only route that reaches a game's log.
     nr::PhaseTimer timer;
@@ -1470,8 +1556,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             {"gemm_projw_nt", uint32_t(NR_GEMM_PROJW_NT)},
             {"ffwd_wgw", uint32_t(NR_FFWD_WGW)},
             {"ffwd_gmajor", uint32_t(NR_FFWD_GMAJOR)},
+            {"gemm_remap", uint32_t(NR_GEMM_REMAP_HOST)},
             {"ffwd_fm2_min", uint32_t(NR_FFWD_FM2_MIN_TOKENS)},
             {"post_alpha", uint32_t(NR_POST_ALPHA)},
+            {"tchain", uint32_t(NR_TCHAIN_TILES)},
             {"upsview_vec", uint32_t(NR_UPSVIEW_VEC)},
             {"repack_vec", uint32_t(NR_REPACK_VEC)},
             {"wide_ups_mask", uint32_t(NR_WIDE_UPS_MASK)},
@@ -1528,7 +1616,9 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         if (!built.count("noise_field")) built["noise_field"] = 0;
         if (!built.count("ffwd_fm2_min")) built["ffwd_fm2_min"] = 0;
         if (!built.count("post_alpha")) built["post_alpha"] = 0;
+        if (!built.count("tchain")) built["tchain"] = 0;
         if (!built.count("ffwd_gmajor")) built["ffwd_gmajor"] = 0;
+        if (!built.count("gemm_remap")) built["gemm_remap"] = 0;
         for (const auto& [name, mine] : want) {
             auto it = built.find(name);
             if (it == built.end()) {
@@ -2104,7 +2194,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                         !flag(argc, argv, "--no-upsview-fold") && !slot_reading_diagnostic(argc, argv)) {
                         for (int k = int(disp.size()) - 1; k >= 0 && producer < 0; --k) {
                             const Disp& q = disp[size_t(k)];
-                            if (q.kern == "gemmproj" && q.push.size() == sizeof(PushGemm)) {
+                            if ((q.kern == "gemmproj" || q.kern == "gemmprojc") && q.push.size() == sizeof(PushGemm)) {
                                 PushGemm g; std::memcpy(&g, q.push.data(), sizeof g);
                                 if (g.o_off == pv.x_off && g.M == pv.W * pv.H) producer = k;
                             } else if (q.kern == "fswin" + std::to_string(2 * C) && q.push.size() == sizeof(PushFSwin)) {
@@ -2115,7 +2205,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     }
                     if (producer >= 0) {
                         Disp& q = disp[size_t(producer)];
-                        if (q.kern == "gemmproj") {
+                        if (q.kern == "gemmproj" || q.kern == "gemmprojc") {
                             PushGemm g; std::memcpy(&g, q.push.data(), sizeof g);
                             g.o_off = pv.o_off; std::memcpy(q.push.data(), &g, sizeof g);
                         } else {
@@ -2890,6 +2980,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             }
             d.kern = std::string("gemm") + (wide ? "v" : "") +
                      (sh.act ? "act" : (resid ? "proj" : "nores")) + (projw ? "w" : "");
+            // The C=512 projections have their own pipeline: at 1080p their grid
+            // is 8.5 waves a SIMD, and the ones given the 9th also start late, so
+            // gemmprojc caps residency at 8 (an LDS pad) and runs W.X^T
+            // (NR_SWAP_AB). Neither pays on the ViT shapes that share gemmproj.
+            // 1080p -8 us, 1440p -24, 4K -35 over the 31 dispatches.
+            if (d.kern == "gemmproj" && s.type.rfind("CCSplitSwin16H", 0) == 0) d.kern = "gemmprojc";
             if (host_boundary && s.type == "CCSplitSwin16HProjPool") {
                 d.kern = "gemmpool";
                 p.p_off = uint32_t(voff[pool_key(s.block)]);
@@ -2897,6 +2993,18 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 p.rows = uint32_t(s.W);
             }
             d.gx = uint32_t((M + mt - 1) / mt); d.gy = uint32_t(N / nt); d.gz = 1;
+#if NR_GEMM_REMAP_HOST
+            // Two token tiles, then every output-channel tile, then the next two
+            // (gemm1x1 NR_GEMM_REMAP_PC). Measured per family and extent: the
+            // ViT contraction gains at every extent, the ViT projection and
+            // expansion at the small ones; the ViT QKV and C=512 products keep
+            // the launch order (slower under every order tried).
+            if (!flag(argc, argv, "--no-gemm-remap") &&
+                (s.type == "CCVit1DFfnContract" ||
+                 (s.type == "CCVit1DProjection" && M < size_t(NR_PROJW_MIN_TOKENS)) ||
+                 (s.type == "CCVit1DFfnExpand" && M <= 1024)))
+                p.remap = 2;
+#endif
             d.push.resize(sizeof p);
             std::memcpy(d.push.data(), &p, sizeof p);
         }
@@ -2996,7 +3104,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                 pack_matrix(p.q2_off,FF_GROUPS*FF_OUT,FF_J);
                 continue;
             }
-            if(pd.kern=="gemmproj" || pd.kern=="gemmprojt" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm") {
+            if(pd.kern=="gemmproj" || pd.kern=="gemmprojc" || pd.kern=="gemmprojt" || pd.kern=="gemmprojw" || pd.kern=="gemmvact" || pd.kern=="gemmvqkv" || pd.kern=="gemmvqkvs" || pd.kern=="gemmvqkvnorm") {
                 PushGemm p{};
                 if(pd.push.size()!=sizeof p) throw std::runtime_error("packed GEMM push mismatch");
                 std::memcpy(&p,pd.push.data(),sizeof p);
@@ -3134,19 +3242,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     fp(disp[j + 1]).tiles_x == fp(disp[i]).tiles_x &&
                     fp(disp[j + 1]).tiles_y == fp(disp[i]).tiles_y &&
                     fp(disp[j + 1]).x_off == fp(disp[j]).o_off &&
-                    // Only where the standalone DS grid ends in a partial round:
-                    // at 1080p C=256 that is 135 windows on 128 slots; at 4K the
-                    // grid is several rounds deep and the fold only adds a chain
-                    // item (measured +0.015 ms at 4K, -0.02..-0.03 at 1080p).
-                    // C=64 and C=128 always (the fold's own layer beats the
-                    // standalone dispatch's ramp and tail at every extent measured:
-                    // 1080p -17 us, 4K -25 us over the four); C=256 only where the
-                    // standalone DS grid ends in a partial round: at 1080p that is
-                    // 135 windows on 128 slots; at 4K the grid is several rounds
-                    // deep and the fold only adds a chain item (+0.015 ms at 4K,
-                    // -0.02..-0.03 at 1080p).
-                    (C < 256 || disp[j + 1].gx * disp[j + 1].gy <= 2u * std::min<uint32_t>(
-                        128u, wg_override ? wg_override : 0xFFFFFFFFu));
+                    // Every width at every extent. C=256 used to stay standalone where
+                    // its grid was several rounds deep (+0.015 ms at 4K then); with
+                    // the later run changes the fold wins there too: the standalone
+                    // kernel's last round runs at a third of occupancy (4K C=256
+                    // DS+UPS folded -34 us, 3440x1440 -58 us).
+                    true;
                 if (ds_fold) ++j;
                 // And the wide fused upsample just before it, as layer 0.
                 const bool up_fold = !ds_fold && NR_PERSIST_DF && (uint32_t(NR_PERSIST_UPS_MASK) & ds_bit) &&
@@ -3154,9 +3255,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                     out.back().push.size() == sizeof(PushFSwin) + sizeof(PushUps) + 4 &&
                     fp(out.back()).tiles_x == fp(disp[i]).tiles_x &&
                     fp(out.back()).tiles_y == fp(disp[i]).tiles_y &&
-                    fp(out.back()).o_off == fp(disp[i]).x_off &&
-                    (C < 256 || out.back().gx * out.back().gy <= 2u * std::min<uint32_t>(
-                        128u, wg_override ? wg_override : 0xFFFFFFFFu));
+                    fp(out.back()).o_off == fp(disp[i]).x_off;
                 Disp up_disp{disp[i].s};
                 if (up_fold) { up_disp = std::move(out.back()); out.pop_back(); }
                 std::vector<const Disp*> lay;
@@ -3375,6 +3474,18 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const size_t v = vsize.count(k) ? vsize.at(k) : 0;
             return align(std::max(v, overread.count(k) ? overread.at(k) : size_t(0)), 256);
         };
+        // **Small slots take cold memory.** Packed tightest, the C=512 blocks at
+        // 1080p-class extents cycle three ~1.4 MB slots, and a GEMM whose output
+        // lands on memory the dispatch just before it freed - lines still in L2
+        // from that dispatch - ran 2-4x slow and varied run to run: the attention
+        // projection 7 -> 16..31 us, +0.1 ms a frame at 1080p and 2560x1080, the
+        // game path's whole gap to one-value-one-slot. So a slot smaller than
+        // NR_ARENA_COLD_MAX only takes a block freed at least NR_ARENA_COLD
+        // dispatches before its first. Large slots (4K's C=512 values are ~5.6 MB)
+        // never showed it and pack as before; the arena did not grow at any
+        // extent measured. `freed_at` keeps, per free block, the last dispatch of
+        // what freed it (merged blocks the latest).
+        std::map<size_t, int> freed_at;
         std::vector<int> order;
         for (const auto& kv : span)
             if (vsize.count(kv.first) && vsize.at(kv.first)) order.push_back(kv.first);
@@ -3383,17 +3494,32 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             if (vsize[a] != vsize[b]) return vsize[a] > vsize[b];
             return a < b;
         });
+        // **NR_TCHAIN:** dispatches joined by tile counters overlap, so a value last
+        // read inside such a stretch stays reserved to the stretch's end (the next
+        // real barrier); otherwise a later dispatch of the stretch could overwrite
+        // what a still-running earlier one reads.
+        if (tchain_active()) {
+            std::vector<int> stretch_end(size_t(nd) + 1);
+            for (int f = nd; f >= 0; --f)
+                stretch_end[size_t(f)] = (f + 1 < nd && tchain_pair(disp[size_t(f)].kern, disp[size_t(f) + 1].kern))
+                                         ? stretch_end[size_t(f) + 1] : f;
+            for (auto& kv : span)
+                if (kv.second.second >= 0 && kv.second.second < nd)
+                    kv.second.second = stretch_end[size_t(kv.second.second)];
+        }
         std::vector<std::pair<size_t, size_t>> free_blocks;   // offset, size
         std::vector<std::pair<int, std::pair<size_t, size_t>>> live;   // last dispatch, block
         size_t top = 0, high = 0;
-        auto release = [&](size_t off, size_t size) {
+        auto release = [&](size_t off, size_t size, int when) {
             free_blocks.push_back({off, size});
+            freed_at[off] = when;
             std::sort(free_blocks.begin(), free_blocks.end());
             std::vector<std::pair<size_t, size_t>> merged;
             for (const auto& b : free_blocks) {
-                if (!merged.empty() && merged.back().first + merged.back().second == b.first)
+                if (!merged.empty() && merged.back().first + merged.back().second == b.first) {
                     merged.back().second += b.second;
-                else merged.push_back(b);
+                    freed_at[merged.back().first] = std::max(freed_at[merged.back().first], freed_at[b.first]);
+                } else merged.push_back(b);
             }
             free_blocks.swap(merged);
             if (!free_blocks.empty() && free_blocks.back().first + free_blocks.back().second == top) {
@@ -3406,27 +3532,33 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
             const int first = span[k].first;
             for (size_t l = 0; l < live.size();) {
                 if (live[l].first < first) {
-                    release(live[l].second.first, live[l].second.second);
+                    release(live[l].second.first, live[l].second.second, live[l].first);
                     live.erase(live.begin() + long(l));
                 } else ++l;
             }
             const size_t need = reserved(k);
             size_t best = free_blocks.size();
+            const bool cold = need < size_t(NR_ARENA_COLD_MAX);
             for (size_t b = 0; b < free_blocks.size(); ++b)
                 if (free_blocks[b].second >= need &&
+                    !(cold && freed_at[free_blocks[b].first] + int(NR_ARENA_COLD) >= first) &&
                     (best == free_blocks.size() || free_blocks[b].second < free_blocks[best].second))
                     best = b;
             size_t off;
             if (best < free_blocks.size()) {
                 off = free_blocks[best].first;
-                if (free_blocks[best].second > need)
+                if (free_blocks[best].second > need) {
                     free_blocks[best] = {off + need, free_blocks[best].second - need};
-                else free_blocks.erase(free_blocks.begin() + long(best));
+                    freed_at[off + need] = freed_at[off];
+                } else free_blocks.erase(free_blocks.begin() + long(best));
             } else {
                 off = top;
                 top += need;
             }
             arena_layout[k] = off;
+            if (std::getenv("NR_ARENA_DUMP"))
+                std::fprintf(stderr, "arena value %d (b%d l%d) disp %d..%d off %zu size %zu\n", k, k / 8, k % 8,
+                             span[k].first, span[k].second, off, need);
             live.push_back({span[k].second, {off, need}});
             high = std::max(high, top);
         }
@@ -3480,6 +3612,241 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         }
         std::printf("NR_CHAIN: %zu barriers replaced by completion counters (epoch word %u)\n",
                     nch, g_chain_epoch_word);
+    }
+
+    // ---- NR_TCHAIN: tile counters in place of barriers ------------------------
+    // A producer counts finished units (attn: a window per workgroup; gemm1x1,
+    // ffwd3, vitattn: a token tile per wave); the next dispatch's workgroups wait
+    // for the tiles they read and the barrier between the two goes (tchain_pair).
+    // Every NR_TCHAIN kernel's push ends with one word, tc_rec: ~0 or the u32
+    // index in the weight blob of its record {wait counters, need, tile table
+    // (weight blob, ~0 = no wait), signal counters, epoch word, error word};
+    // counters and error words live after the activation arena (zero-filled).
+    g_tc_nobar.assign(disp.size(), 0);
+    g_tc_words.clear();
+    g_tc_err.clear();
+    tc_expect.clear(); tc_pair.clear(); tc_err.clear(); tc_base = 0; tc_words = 0;
+    if (NR_TCHAIN_TILES) {
+        const bool on = tchain_active();
+        act_total = align(act_total, 256);
+        g_tc_base = act_total / 4;
+        // The frame counter: ticked by the frame's first fswin32 (a real barrier
+        // follows it), read as the epoch by every chained consumer that is not a
+        // persistent run (those count their own frames).
+        size_t tick = disp.size();
+        for (size_t i = 0; i < disp.size() && tick == disp.size(); ++i) if (disp[i].kern == "fswin32") tick = i;
+        const uint32_t frame_word = uint32_t(g_tc_base);
+        g_tc_words.push_back(0u);
+        std::vector<std::array<uint32_t, 7>> rec(disp.size());   // word 6: NR_TC_MAGIC (nr_chain.glsl)
+        for (auto& r : rec) r = {0xFFFFFFFFu, 0u, 0xFFFFFFFFu, 0xFFFFFFFFu, frame_word, 0u, 0x54434852u};
+        if (tick < disp.size()) rec[tick][1] = 1u;
+        auto putw = [&](const void* p, size_t n) {
+            wblob.resize(align(wblob.size(), 16));
+            const size_t o = wblob.size();
+            wblob.insert(wblob.end(), (const uint8_t*)p, (const uint8_t*)p + n);
+            return uint32_t(o / 4);
+        };
+        size_t nch = 0;
+        bool big_frame = false;
+        for (const Disp& d : disp)
+            if (is_persist_kern(d.kern)) {
+                PushPersist pp{}; std::memcpy(&pp, d.push.data(), sizeof pp);
+                big_frame = big_frame || (pp.n_layers && pp.total_windows / pp.n_layers > 4096u);
+            }
+        auto wword = [&](uint32_t i) { uint32_t v; std::memcpy(&v, wblob.data() + size_t(i) * 4, 4); return v; };
+        // The activation a dispatch reads from its predecessor / writes for its
+        // successor. A persistent run: its last layer's output, its UPS layer's
+        // lower-level input (records in the weight blob); the fused upsample: its
+        // lower-level input.
+        auto io = [&](const Disp& d, bool out) -> uint32_t {
+            uint32_t f[2] = {};
+            if (d.kern.rfind("gemm", 0) == 0) { PushGemm g{}; std::memcpy(&g, d.push.data(), sizeof g); f[0] = g.x_off; f[1] = g.o_off; }
+            else if (is_persist_kern(d.kern)) {
+                PushPersist pp{}; std::memcpy(&pp, d.push.data(), sizeof pp);
+                const bool ds = d.kern.rfind("fswinpds", 0) == 0, ups = d.kern.rfind("fswinpup", 0) == 0;
+                f[0] = ups && pp.ds_off ? wword(pp.ds_off) : wword(pp.layers_off);
+                f[1] = ds && pp.ds_off ? wword(pp.ds_off + 1u)          // the DS projection's output
+                     : wword(pp.layers_off + (pp.n_layers - 1u) * uint32_t(sizeof(PersistRec) / 4) + 1u);
+            } else if (d.kern == "fswindsp32") {
+                PushDsProj dp{}; std::memcpy(&dp, d.push.data() + sizeof(PushFSwin), sizeof dp);
+                std::memcpy(f, d.push.data(), 4); f[1] = dp.o_off;
+            } else if (d.kern == "fswinfusedup32") {
+                PushUps u{}; std::memcpy(&u, d.push.data() + sizeof(PushFSwin), sizeof u);
+                f[0] = u.p_off; f[1] = 0xFFFFFFFEu;
+            } else std::memcpy(f, d.push.data(), 8);                    // attn, ffwd3, vitattn: x_off, o_off first
+            return f[out ? 1 : 0];
+        };
+        // The consumer's gather grid: a UPS-first run or the fused upsample
+        // reads the lower level in its own itiles_x raster (the plain gather:
+        // none of these pipelines builds NR_WIDE_UPS_VIEW).
+        auto ups_grid = [&](const Disp& d, uint32_t& itx, uint32_t& ity) -> bool {
+            PushUps u{};
+            if (is_persist_kern(d.kern)) {
+                PushPersist pp{}; std::memcpy(&pp, d.push.data(), sizeof pp);
+                if (!pp.ds_off) return false;
+                for (uint32_t k = 0; k < sizeof u / 4; ++k) { const uint32_t v = wword(pp.ds_off + k); std::memcpy(reinterpret_cast<uint32_t*>(&u) + k, &v, 4); }
+            } else std::memcpy(&u, d.push.data() + sizeof(PushFSwin), sizeof u);
+            itx = u.itiles_x; ity = u.itiles_y;
+            return itx != 0u && ity != 0u;
+        };
+        // A gemm1x1 producer's M tile (token rows) and waves along N (each wave
+        // signals every token tile of the M tile), per pipeline.
+        auto gemm_mt_wn = [](const std::string& k) -> std::pair<uint32_t, uint32_t> {
+            if (k == "gemmvact" || k == "gemmvqkvnorm") return {NR_GEMM_WIDE_MT, NR_GEMM_WIDE_NT / 64};
+            if (k == "gemmprojw") return {NR_GEMM_PROJW_MT, NR_GEMM_PROJW_NT / 64};
+            return {NR_GEMM_PROJ_MT, NR_GEMM_PROJ_NT / 32};   // gemmproj, gemmprojc, gemmprojt
+        };
+        // Token tiles a table covers: 4096 holds 4K's C=512 grid (60x34) and every
+        // ViT one; the decoder's upsample levels take their own raster (4K C=64: 32640).
+        for (size_t i = 0; on && i + 1 < disp.size(); ++i) {
+            const Disp& P = disp[i]; Disp& Q = disp[i + 1];
+            if (!tchain_pair(P.kern, Q.kern)) continue;
+            if (tick > i) continue;   // no frame tick before this pair
+            // The persistent runs' boundaries pay where the runs are short: 1080p
+            // -0.06 ms, 1440p (C=64 3600 windows a layer) -0.03, but 4K (8160) +0.03 -
+            // there the next run's workgroups waiting in their slots cost more than
+            // the drain gives back. So none of them once a run has more than 4096
+            // windows a layer. The layout probe counts them as chained anyway,
+            // which only keeps values a little longer.
+            auto run_kern = [](const std::string& k) {
+                return is_persist_kern(k) || k == "fswinfusedup32" || k == "fswindsp32";
+            };
+            if (big_frame && (run_kern(P.kern) || run_kern(Q.kern))) continue;
+            if (std::getenv("NR_TCHAIN_DEBUG")) {
+                uint32_t a = 0, b = 0; const bool ok = (is_persist_kern(Q.kern) || Q.kern == "fswinfusedup32") ? ups_grid(Q, a, b) : true;
+                std::printf("tchain? %s -> %s: out %u in %u grid %u/%u ok %d\n", P.kern.c_str(), Q.kern.c_str(), io(P, true), io(Q, false), a, b, int(ok));
+            }
+            if (io(Q, false) != io(P, true)) continue;   // not reading its predecessor's output: keep the barrier
+            // Consumers that gather through an upsample must read the producer's
+            // own tile raster.
+            uint32_t itx = 0, ity = 0;
+            const bool q_ups = Q.kern.rfind("fswinpup", 0) == 0 || Q.kern == "fswinfusedup32";
+            if (q_ups && !ups_grid(Q, itx, ity)) continue;
+            uint32_t T = 4096;
+            if (is_persist_kern(Q.kern)) {   // the consumer run's own tile raster
+                PushPersist qp{}; std::memcpy(&qp, Q.push.data(), sizeof qp);
+                T = std::max(T, wword(qp.layers_off + 13u) * wword(qp.layers_off + 14u));
+            }
+            if (is_persist_kern(P.kern)) {
+                PushPersist pp{}; std::memcpy(&pp, P.push.data(), sizeof pp);
+                const uint32_t lb = pp.layers_off + (pp.n_layers - 1u) * uint32_t(sizeof(PersistRec) / 4);
+                T = std::max(T, wword(lb + 13u) * wword(lb + 14u));
+            }
+            if (q_ups) T = std::max(T, itx * ity);
+            // Table entry: counter | need << 20 (need = producer units a frame).
+            std::vector<uint32_t> t(T, 0xFFFFFFFFu);
+            uint32_t ncnt = T;
+            auto ent = [](uint32_t c, uint32_t need) { return c | (need << 20); };
+            if (P.kern == "attn") {                                     // tile -> window
+                PushAttn pa{}; std::memcpy(&pa, P.push.data(), sizeof pa);
+                ncnt = P.gx * P.gy;
+                for (uint32_t wy = 0; wy < P.gy; ++wy)
+                    for (uint32_t wx = 0; wx < P.gx; ++wx)
+                        for (int q = 0; q < 4; ++q) {
+                            const int tx = 2 * int(wx) + pa.shift + (q & 1), ty = 2 * int(wy) + pa.shift_y + (q >> 1);
+                            if (tx < 0 || ty < 0 || tx >= int(pa.tiles_x) || ty >= int(pa.tiles_y)) continue;
+                            t.at(uint32_t(ty) * pa.tiles_x + uint32_t(tx)) = ent(wy * P.gx + wx, P.gz);
+                        }
+            } else if (P.kern.rfind("gemm", 0) == 0) {                  // every M tile, all N tiles
+                const auto mw = gemm_mt_wn(P.kern);
+                for (uint32_t k = 0; k < P.gx * (mw.first / 16u); ++k) t.at(k) = ent(k, P.gy * mw.second);
+            } else if (P.kern == "vitattn") {                            // a workgroup a query tile and head
+                PushVAttn pv{}; std::memcpy(&pv, P.push.data(), sizeof pv);
+                for (uint32_t k = 0; k < (pv.tokens + 15u) / 16u; ++k) t.at(k) = ent(k, P.gy);
+            } else if (P.kern == "fswindsp32" || P.kern.rfind("fswinpds", 0) == 0) {   // DS windows -> next-level tiles
+                PushFSwin fs{}; PushDsProj dp{}; uint32_t gx = P.gx, gy = P.gy;
+                if (P.kern == "fswindsp32") {
+                    std::memcpy(&fs, P.push.data(), sizeof fs);
+                    std::memcpy(&dp, P.push.data() + sizeof(PushFSwin), sizeof dp);
+                } else {
+                    PushPersist pp{}; std::memcpy(&pp, P.push.data(), sizeof pp);
+                    if (!pp.ds_off) continue;
+                    const uint32_t lb = pp.layers_off + (pp.n_layers - 1u) * uint32_t(sizeof(PersistRec) / 4);
+                    for (uint32_t k = 0; k < sizeof fs / 4; ++k) { const uint32_t v = wword(lb + k); std::memcpy(reinterpret_cast<uint32_t*>(&fs) + k, &v, 4); }
+                    for (uint32_t k = 0; k < sizeof dp / 4; ++k) { const uint32_t v = wword(pp.ds_off + k); std::memcpy(reinterpret_cast<uint32_t*>(&dp) + k, &v, 4); }
+                    gx = wword(lb + 20u); gy = wword(lb + 21u);
+                }
+                const uint32_t wr = dp.writer_rows ? dp.writer_rows : dp.rows;
+                // The identity shear only (the shader's NR_DS_IDENTITY_FAST case).
+                if (dp.mode == 2u || dp.raster != dp.crow || wr != dp.rows) continue;
+                // The consumer reads the DS output in its own tile raster (a run's first
+                // layer), or as canonical C=512 token tiles (ffwd3: rows of otx tiles).
+                if (is_persist_kern(Q.kern)) {
+                    PushPersist qp{}; std::memcpy(&qp, Q.push.data(), sizeof qp);
+                    if (wword(qp.layers_off + 13u) != dp.otx) continue;
+                }
+                const int lx = std::min(std::min(int(fs.pool_tiles_x * 4u), int(dp.raster)), int(dp.otx * 4u)) - 1;
+                const int ly = std::min(int(fs.pool_tiles_y * 4u), int(wr)) - 1;
+                std::vector<uint32_t> nd(T, 0u);
+                for (uint32_t wy = 0; wy < gy; ++wy)
+                    for (uint32_t wx = 0; wx < gx; ++wx) {
+                        const int px0 = (2 * int(wx) + fs.shift) * 2, py0 = (2 * int(wy) + fs.shift_y) * 2;
+                        const int x0 = std::max(px0, 0), x1 = std::min(px0 + 3, lx), y0 = std::max(py0, 0), y1 = std::min(py0 + 3, ly);
+                        if (x0 > x1 || y0 > y1) continue;
+                        for (int ty = y0 / 4; ty <= y1 / 4; ++ty)
+                            for (int tx = x0 / 4; tx <= x1 / 4; ++tx) ++nd.at(uint32_t(ty) * dp.otx + uint32_t(tx));
+                    }
+                for (uint32_t k = 0; k < T; ++k) if (nd[k]) t[k] = ent(k, nd[k]);
+            } else if (is_persist_kern(P.kern)) {                        // the last layer: a window a tile, once
+                PushPersist pp{}; std::memcpy(&pp, P.push.data(), sizeof pp);
+                const uint32_t lb = pp.layers_off + (pp.n_layers - 1u) * uint32_t(sizeof(PersistRec) / 4);
+                const uint32_t tx = wword(lb + 13u), ty = wword(lb + 14u);
+                if (q_ups && itx != tx) continue;
+                for (uint32_t k = 0; k < tx * ty; ++k) t.at(k) = ent(k, 1u);
+            } else {                                                     // ffwd3: a wave a group and tile
+                PushFfwd3 pf{}; std::memcpy(&pf, P.push.data(), sizeof pf);
+                for (uint32_t k = 0; k < (pf.M + 15u) / 16u; ++k) t.at(k) = ent(k, 8u);
+            }
+            const uint32_t err = uint32_t(g_tc_base + g_tc_words.size());
+            g_tc_err.push_back(g_tc_words.size());
+            g_tc_words.push_back(0u);                                     // error word
+            const uint32_t cnt = uint32_t(g_tc_base + g_tc_words.size());
+            g_tc_words.insert(g_tc_words.end(), size_t(ncnt), 0u);
+            // C=512 projections M-major (every N tile of M tile 0, then M tile 1 ...):
+            // their inputs complete in token order.
+            if (Q.kern == "gemmprojc") {
+                PushGemm pg{}; std::memcpy(&pg, Q.push.data(), sizeof pg);
+                pg.remap = 1u;
+                std::memcpy(Q.push.data(), &pg, sizeof pg);
+            }
+            for (uint32_t k = 0; k < uint32_t(t.size()); ++k)
+                if (t[k] != 0xFFFFFFFFu)
+                    tc_expect.push_back({cnt - uint32_t(g_tc_base) + (t[k] & 0xFFFFFu), t[k] >> 20, uint32_t(tc_pair.size())});
+            tc_pair.push_back(P.kern + " -> " + Q.kern);
+            rec[i][3] = cnt;
+            rec[i + 1][0] = cnt; rec[i + 1][2] = putw(t.data(), t.size() * 4);
+            rec[i + 1][5] = err;
+            g_tc_nobar[i] = 1; ++nch;
+        }
+        for (size_t i = 0; i < disp.size(); ++i) {
+            if (!tchain_kern(disp[i].kern)) continue;
+            const uint32_t r = (rec[i][1] == 0u && rec[i][2] == 0xFFFFFFFFu && rec[i][3] == 0xFFFFFFFFu)
+                ? 0xFFFFFFFFu : putw(rec[i].data(), sizeof rec[i]);
+            const size_t o = disp[i].push.size();
+            disp[i].push.resize(o + 4);
+            std::memcpy(disp[i].push.data() + o, &r, 4);
+            if (std::getenv("NR_TCHAIN_DEBUG") && (i == tick || i < 3))
+                std::printf("tchain rec: disp %zu %s push %zu rec %u [%u %u %u %u %u %u]\n", i, disp[i].kern.c_str(),
+                            disp[i].push.size(), r, rec[i][0], rec[i][1], rec[i][2], rec[i][3], rec[i][4], rec[i][5]);
+        }
+        act_total += align(g_tc_words.size() * 4, 256);
+        if (on) nr::logf("tile counters: %zu barriers replaced", nch);
+        tc_base = uint32_t(g_tc_base); tc_words = uint32_t(g_tc_words.size());
+        for (size_t e : g_tc_err) tc_err.push_back(uint32_t(e));
+        // One counter, one count a frame: several tiles may name the same counter.
+        std::sort(tc_expect.begin(), tc_expect.end(),
+                  [](const TcExpect& a, const TcExpect& b) { return a.word < b.word; });
+        size_t kept = 0;
+        for (size_t k = 0; k < tc_expect.size(); ++k) {
+            if (kept && tc_expect[kept - 1].word == tc_expect[k].word) {
+                if (tc_expect[kept - 1].need != tc_expect[k].need)
+                    nr::logf("[nr] check: counter %u named with need %u and %u", tc_expect[k].word,
+                             tc_expect[kept - 1].need, tc_expect[k].need);
+                continue;
+            }
+            tc_expect[kept++] = tc_expect[k];
+        }
+        tc_expect.resize(kept);
     }
 
     // ---- device ------------------------------------------------------------
@@ -3692,7 +4059,7 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         const std::string p = spv_dir + "/g_" + d.kern + ".spv";
         if (d.kern.rfind("fswindsp",0)==0)
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
-                                sizeof(PushFSwin)+sizeof(PushDsProj));
+                                sizeof(PushFSwin)+sizeof(PushDsProj) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
         else if (d.kern=="fswinimagepreds32")
             kern[d.kern].create(ctx,p,{act.handle,act.handle,wgt.handle,wgt.handle,wgt.handle,act.handle},
                                 sizeof(PushFSwin)+sizeof(PushPreImage),{&tex_in});
@@ -3708,10 +4075,12 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                                 sizeof(PushFSwin)+sizeof(PushUps));
         else if (is_persist_kern(d.kern))
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
-                                         wgt.handle, wgt.handle, act.handle}, sizeof(PushPersist));
+                                         wgt.handle, wgt.handle, act.handle},
+                                sizeof(PushPersist) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
         else if (d.kern.rfind("fswin", 0) == 0)
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
-                                         wgt.handle, wgt.handle, act.handle}, sizeof(PushFSwin));
+                                         wgt.handle, wgt.handle, act.handle},
+                                sizeof(PushFSwin) + (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
         else if (d.kern.rfind("pool", 0) == 0)
             kern[d.kern].create(ctx, p, {act.handle}, sizeof(PushPool));
         else if (d.kern == "decups")
@@ -3730,21 +4099,25 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
                                 {&surf0, &surf1, &tex_in});
         else if (d.kern == "vitattn")
             kern[d.kern].create(ctx, p, {act.handle, wgt.handle, act.handle},
-                                sizeof(PushVAttn) + (g_chain_kern.count(d.kern) ? 16 : 0));
+                                sizeof(PushVAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
         else if (d.kern.rfind("upsblend", 0) == 0)
             kern[d.kern].create(ctx, p, {act.handle, wgt.handle}, sizeof(PushUps));
         else if (d.kern == "attn")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, wgt.handle,
-                                         wgt.handle, act.handle}, sizeof(PushAttn) + (g_chain_kern.count(d.kern) ? 16 : 0));
+                                         wgt.handle, act.handle}, sizeof(PushAttn) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
         else if (d.kern == "ffwd3" || d.kern == "ffwd3w")
             kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle,
                                          wgt.handle, wgt.handle, act.handle},
-                                sizeof(PushFfwd3) + (g_chain_kern.count(d.kern) ? 16 : 0));
+                                sizeof(PushFfwd3) + (g_chain_kern.count(d.kern) ? 16 : 0) + (NR_TCHAIN_TILES ? 4 : 0));
         else
             kern[d.kern].create(ctx, p, {act.handle, act.handle, act.handle, wgt.handle,
                                          wgt.handle, act.handle, wgt.handle, act.handle},
-                                sizeof(PushGemm) + (g_chain_kern.count(d.kern) ? 16 : 0));
+                                sizeof(PushGemm) + (g_chain_kern.count(d.kern) ? 16 : 0) +
+                                (NR_TCHAIN_TILES && tchain_kern(d.kern) ? 4 : 0));
     }
+    for (const Disp& d : disp)   // a push longer than its pipeline's range reads garbage past the end
+        if (kern.count(d.kern) && d.push.size() > kern.at(d.kern).push_range)
+            throw std::runtime_error("push constants longer than the pipeline's range: " + d.kern);
     const size_t cache_bytes = ctx.save_pipeline_cache();
     timer.mark("pipelines");
     // `--wiring` prints what each dispatch reads and writes. A producer and a
@@ -3934,6 +4307,10 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
     if (!g_chain_kern.empty()) {
         if (runner.no_barrier_after.size() != disp.size()) runner.no_barrier_after.assign(disp.size(), 0);
         for (size_t i = 0; i < disp.size(); ++i) if (g_chain_nobar[i]) runner.no_barrier_after[i] = 1;
+    }
+    if (std::find(g_tc_nobar.begin(), g_tc_nobar.end(), 1) != g_tc_nobar.end()) {
+        if (runner.no_barrier_after.size() != disp.size()) runner.no_barrier_after.assign(disp.size(), 0);
+        for (size_t i = 0; i < disp.size(); ++i) if (g_tc_nobar[i]) runner.no_barrier_after[i] = 1;
     }
     // Diagnostic NR_DUP=k1,k2: run those kernels twice back to back (idempotent
     // layers only), so the second copy shows the kernel with warm caches.
@@ -5276,6 +5653,19 @@ int main(int argc, char** argv) try {
     const double mhz = nrvk::Telemetry::mean(tel.mhz);
     std::printf("\n%zu dispatches, one submit: %.3f ms  @ %.0f MHz\n",
                 steps.size(), ms, mhz);
+    if (!g_tc_err.empty()) {   // NR_TCHAIN: a wait that ran out of its bound set its error word
+        std::vector<uint32_t> w(g_tc_words.size());
+        ctx.download(act, VkDeviceSize(g_tc_base) * 4, w.data(), w.size() * 4);
+        size_t bad = 0;
+        for (size_t e : g_tc_err) bad += w[e] != 0u;
+        if (std::getenv("NR_TCHAIN_DEBUG")) {
+            uint32_t ep = 0; ctx.download(act, VkDeviceSize(g_chain_epoch_word) * 4, &ep, 4);
+            std::printf("tile counters: frame word %u, C=256 epoch %u, errors %zu; words 0..8:", w[0], ep, bad);
+            for (size_t i = 0; i < 9 && i < w.size(); ++i) std::printf(" %u", w[i]);
+            std::printf(" base %zu\n", g_tc_base);
+        }
+        if (bad) std::printf("tile counters: %zu dispatches ran out of a wait bound (output not trustworthy)\n", bad);
+    }
     if (!tel.mhz.empty()) {
         double lo=1e30, hi=0; size_t samples=0;
         for (double v:tel.mhz) if (v>=0) {lo=std::min(lo,v);hi=std::max(hi,v);++samples;}

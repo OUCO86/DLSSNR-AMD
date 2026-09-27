@@ -5,7 +5,8 @@ Runs the neural rendering (NR) model of DLSS 5 in games on AMD graphics cards. T
 reimplemented in Vulkan; NVIDIA's runtime is neither needed nor called.
 
 This Windows version is far from finished and is slower than the Linux version. Expect games
-that do not work.
+that do not work. The current version has not been tested in any game: there is no guarantee
+that it runs correctly, and getting it to work may need your own testing and code changes.
 
 On Windows the game itself is D3D11/D3D12 and has no Vulkan device, so the installer puts DXVK
 and vkd3d-proton into the game folder: the game runs on Vulkan and NR shares its device.

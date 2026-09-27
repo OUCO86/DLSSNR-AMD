@@ -515,6 +515,191 @@ struct Runtime::Impl {
     VkFormat colour_format{};
     uint32_t width{}, height{};
 
+    // ---- the in-game check (diagnostic) --------------------------------------
+    //
+    // For the in-game green screen (2026-09): a feature that stays wrong until
+    // the next one, and nothing in the log. Every kEvery recordings the
+    // recording also copies, after the network, the tile-counter region (frame
+    // word, the waits' error words, the counters), each persistent run's epoch
+    // and error word, and an 8x8 grid of the history the next frame reads, into
+    // a host-visible buffer. kLag recordings later - that submission has long
+    // run - the render thread reads it and logs whatever is off: a wait that
+    // ran out of its bound (it then reads whatever is there), a counter that is
+    // not need x frames, a run whose epoch is not the frame count, a history
+    // holding NaN/Inf. Never a wait. Off unless NR_GAME_CHECK=1.
+    struct Check {
+        static constexpr uint64_t kEvery = 32, kLag = 16, kBeat = 1920;
+        static constexpr uint32_t kGrid = 8;
+        bool off{};
+        nrvk::Buffer buf{};
+        VkDeviceSize persist_at{}, hist_at{};
+        uint64_t written_at{~0ull};   // the recording that copied, until read
+        uint64_t feature{};           // the feature bound at that recording
+        bool hist{};                  // that copy took the history
+        size_t tc_errors{}, persist_errors{};
+        size_t off_count{~size_t(0)};
+        uint64_t beat_at{};
+        std::set<uint64_t> hist_bad;
+        std::map<uint64_t, int> feature_checks;
+    };
+    Check check;
+    void check_record(VkCommandBuffer cmd) {
+        auto& k = check;
+        auto& s = session;
+        if (k.off) return;
+        if (!k.buf.handle) {
+            const char* e = std::getenv("NR_GAME_CHECK");
+            if (!e || std::atoi(e) != 1) { k.off = true; return; }
+            VkDeviceSize n = VkDeviceSize(s.tc_words) * 4;
+            k.persist_at = n;
+            n += VkDeviceSize(s.persist_err.size()) * 8;
+            k.hist_at = n = (n + 15) & ~VkDeviceSize(15);
+            n += VkDeviceSize(Check::kGrid) * Check::kGrid * 16;
+            try {
+                k.buf = s.ctx.buffer(n, true);
+            } catch (const std::exception& x) {
+                nr::logf("[nr] check: no host-visible buffer (%s), off", x.what());
+                k.off = true;
+                return;
+            }
+            nr::logf("[nr] check on (%ux%u): %zu chained pairs, %zu counters, %zu persistent runs, history %s",
+                     width, height, s.tc_pair.size(), s.tc_expect.size(), s.persist_err.size(),
+                     temporal.enabled ? "8x8 texels" : "none");
+        }
+        if (recordings % Check::kEvery) return;
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        std::vector<VkBufferCopy> r;
+        if (s.tc_words) r.push_back({VkDeviceSize(s.tc_base) * 4, 0, VkDeviceSize(s.tc_words) * 4});
+        for (size_t i = 0; i < s.persist_err.size(); ++i)   // epoch word, error word
+            r.push_back({VkDeviceSize(s.persist_err[i]) - 4, k.persist_at + VkDeviceSize(i) * 8, 8});
+        if (!r.empty()) vkCmdCopyBuffer(cmd, s.act.handle, k.buf.handle, uint32_t(r.size()), r.data());
+        k.hist = temporal.enabled;
+        if (k.hist) {
+            const auto& h = temporal.hist(temporal.hcur);   // what the next frame reads
+            std::vector<VkBufferImageCopy> ir;
+            for (uint32_t y = 0; y < Check::kGrid; ++y)
+                for (uint32_t x = 0; x < Check::kGrid; ++x) {
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = k.hist_at + VkDeviceSize(y * Check::kGrid + x) * 16;
+                    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    c.imageOffset = {int32_t((2 * x + 1) * h.w / (2 * Check::kGrid)),
+                                     int32_t((2 * y + 1) * h.h / (2 * Check::kGrid)), 0};
+                    c.imageExtent = {1, 1, 1};
+                    ir.push_back(c);
+                }
+            vkCmdCopyImageToBuffer(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, k.buf.handle,
+                                   uint32_t(ir.size()), ir.data());
+        }
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        k.written_at = recordings;
+        k.feature = bound_feature;
+    }
+    void check_read() {
+        auto& k = check;
+        auto& s = session;
+        if (!k.buf.handle || k.written_at == ~0ull || recordings < k.written_at + Check::kLag) return;
+        const uint64_t at = k.written_at;
+        k.written_at = ~0ull;
+        const unsigned long long fid = (unsigned long long)k.feature;
+        const uint32_t* w = k.buf.as<uint32_t>();
+        const std::vector<uint32_t> v(w, w + s.tc_words);
+        const uint32_t* p = w + k.persist_at / 4;
+        const bool have_f = s.tc_words != 0;
+        const uint32_t f = have_f ? v[0] : (s.persist_err.empty() ? 0u : p[0]);
+        // Waits that ran out: sticky words, so the count only grows.
+        size_t te = 0;
+        std::string names;
+        for (size_t i = 0; i < s.tc_err.size(); ++i)
+            if (v[s.tc_err[i]]) {
+                ++te;
+                if (names.size() < 300 && i < s.tc_pair.size()) names += (names.empty() ? "" : ", ") + s.tc_pair[i];
+            }
+        if (te > k.tc_errors) {
+            nr::logf("[nr] check: %zu tile-counter waits ran out by frame %u (recording %llu, feature %llx): %s",
+                     te, f, (unsigned long long)at, fid, names.c_str());
+            k.tc_errors = te;
+        }
+        size_t pe = 0;
+        std::string layers;
+        for (size_t i = 0; i < s.persist_err.size(); ++i)
+            if (p[2 * i + 1]) {
+                ++pe;
+                layers += " run " + std::to_string(i) + " layer " + std::to_string(p[2 * i + 1] - 1u);
+            }
+        if (pe > k.persist_errors) {
+            nr::logf("[nr] check: %zu persistent-run waits ran out by frame %u (recording %llu, feature %llx):%s",
+                     pe, f, (unsigned long long)at, fid, layers.c_str());
+            k.persist_errors = pe;
+        }
+        // After whole frames every counter holds need x frames and every run's epoch is the frame count.
+        size_t bad = 0, epoch_bad = 0;
+        std::string ex;
+        if (have_f) {
+            for (const auto& e : s.tc_expect) {
+                const uint32_t want = e.need * f;
+                if (v[e.word] == want) continue;
+                if (bad < 4) {
+                    char b[160];
+                    std::snprintf(b, sizeof b, " [%s: counter %u = %u, want %u x %u]",
+                                  e.pair < s.tc_pair.size() ? s.tc_pair[e.pair].c_str() : "?", e.word, v[e.word], e.need, f);
+                    ex += b;
+                }
+                ++bad;
+            }
+            for (size_t i = 0; i < s.persist_err.size(); ++i)
+                if (p[2 * i] != f) {
+                    if (epoch_bad < 4) ex += " [run " + std::to_string(i) + " epoch " + std::to_string(p[2 * i]) + "]";
+                    ++epoch_bad;
+                }
+        }
+        if (have_f && bad + epoch_bad != k.off_count) {
+            if (bad + epoch_bad)
+                nr::logf("[nr] check: frame %u (recording %llu, feature %llx): %zu of %zu counters and %zu of %zu "
+                         "run epochs off:%s", f, (unsigned long long)at, fid, bad, s.tc_expect.size(), epoch_bad,
+                         s.persist_err.size(), ex.c_str());
+            else
+                nr::logf("[nr] check: frame %u: all %zu counters = need x frames, %zu run epochs = frames%s", f,
+                         s.tc_expect.size(), s.persist_err.size(), k.off_count == ~size_t(0) ? "" : " again");
+            k.off_count = bad + epoch_bad;
+        }
+        // The history the next frame reads.
+        if (!k.hist) return;
+        const float* h = reinterpret_cast<const float*>(w + k.hist_at / 4);
+        const uint32_t n = Check::kGrid * Check::kGrid;
+        uint32_t nonfinite = 0;
+        float peak = 0.0f;
+        double mean[3] = {};
+        for (uint32_t i = 0; i < n; ++i)
+            for (uint32_t c = 0; c < 4; ++c) {
+                const float x = h[i * 4 + c];
+                if (!std::isfinite(x)) { ++nonfinite; continue; }
+                peak = std::max(peak, std::fabs(x));
+                if (c < 3) mean[c] += x / n;
+            }
+        const bool weird = nonfinite || peak > 1024.0f;
+        int& seen = k.feature_checks[k.feature];
+        ++seen;
+        if (weird && k.hist_bad.insert(k.feature).second)
+            nr::logf("[nr] check: history of feature %llx at frame %u: %u NaN/Inf of %u values, max |v| %g, "
+                     "mean %.4f %.4f %.4f", fid, f, nonfinite, n * 4, double(peak), mean[0], mean[1], mean[2]);
+        else if (seen <= 2 || at >= k.beat_at + Check::kBeat) {
+            // A new feature's first two looks, then a heartbeat.
+            nr::logf("[nr] check: frame %u, feature %llx: history mean %.4f %.4f %.4f, max %.4g; waits ran out "
+                     "%zu+%zu, counters off %zu", f, fid, mean[0], mean[1], mean[2], double(peak), k.tc_errors,
+                     k.persist_errors, k.off_count == ~size_t(0) ? size_t(0) : k.off_count);
+            if (seen > 2) k.beat_at = at;
+        }
+        if (k.feature_checks.size() > 256) k.feature_checks.clear();
+    }
+
     ~Impl() {
         // Caller has already completed its submitted command buffers.
         auto& s = session;
@@ -548,6 +733,7 @@ struct Runtime::Impl {
         if (mask_pre.device) mask_pre.destroy();
         if (mask_resolve.device) mask_resolve.destroy();
         if (timing) { vkDestroyQueryPool(s.ctx.device, timing, nullptr); timing = VK_NULL_HANDLE; }
+        if (check.buf.handle) s.ctx.destroy(check.buf);
         temporal.destroy(s.ctx);
         if (s.ctx.pipeline_cache) {
             vkDestroyPipelineCache(s.ctx.device, s.ctx.pipeline_cache, nullptr);
@@ -1252,6 +1438,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 VK_ACCESS_TRANSFER_READ_BIT,t.after_stage,t.after_access);
     }
     impl_->controls(effective);
+    impl_->check_read();
     // The network extent (Model Resolution); the frame is frame.width x frame.height.
     const uint32_t nw = impl_->mw, nh = impl_->mh;
     const uint32_t passes = std::min<uint32_t>(std::max(effective.passes, 1), impl_->max_passes);
@@ -1648,6 +1835,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // either contract - they were not built with device-scoped loads
             // and the arena is not the only thing they read.
             const bool last = i + 1 >= s.steps.size();
+            // C=512 dispatches joined by tile counters (nr_graph.cpp NR_TCHAIN) have no barrier.
+            if (!last && i < s.runner.no_barrier_after.size() && s.runner.no_barrier_after[i]) continue;
             compute_barrier(cmd, s.runner.exec_barrier && !last,
                             s.runner.inv_barrier && !last);
         }
@@ -1688,6 +1877,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         if (t.pingpong) t.hcur ^= 1u;
         if (history_consumed) *history_consumed = gate;
     }
+    impl_->check_record(cmd);
     // Retired features, destroyed once enough recordings have gone by that the
     // submission holding their last use cannot still be executing.
     ++impl_->recordings;

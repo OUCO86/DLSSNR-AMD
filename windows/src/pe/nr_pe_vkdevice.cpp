@@ -24,6 +24,8 @@ struct Queue { VkDevice device; uint32_t family; VkQueue queue; };
 std::vector<Queue> queues;
 // The queue families the game asked for in its last vkCreateDevice.
 std::vector<uint32_t> requested_families;
+// Devices created with the network's features added (network_features_added).
+std::vector<VkDevice> augmented_devices;
 void (*device_callback)(VkDevice) = nullptr;
 
 using PFN_CreateInstance = VkResult(VKAPI_PTR*)(const VkInstanceCreateInfo*,
@@ -162,6 +164,7 @@ VkResult VKAPI_PTR hooked_create_device(VkPhysicalDevice physical, const VkDevic
             std::lock_guard<std::mutex> guard(lock);
             seen.physical = physical;
             seen.device = *out;
+            if (added) augmented_devices.push_back(*out);
         }
         log("[nr] Vulkan device created by the game");
         if (device_callback) device_callback(*out);
@@ -237,6 +240,13 @@ bool family_of(VkQueue queue, uint32_t* family) {
     if (!queue || !family) return false;
     for (const auto& q : queues)
         if (q.queue == queue) { *family = q.family; return true; }
+    return false;
+}
+
+bool network_features_added(VkDevice device) {
+    std::lock_guard<std::mutex> guard(lock);
+    for (VkDevice d : augmented_devices)
+        if (d == device) return true;
     return false;
 }
 

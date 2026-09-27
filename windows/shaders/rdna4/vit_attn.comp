@@ -36,7 +36,22 @@ layout(set = 0, binding = 0, std430) NR_COH    buffer ActE4M3v { uint act_v4[]; 
 #define NR_LOAD_A_ACT(f, off, s)     NR_LOAD_C8_ACT(f, off, s)
 #define NR_LOAD_B_ACT(f, off, s)     NR_LOAD_C8_ACT(f, off, s)
 #define NR_LOAD_B_ROW_ACT(f, off, s) coopMatLoad(f, act_v4, (off) / 4u, (s) / 4u, gl_CooperativeMatrixLayoutRowMajor)
+#ifndef NR_VBDA
+#define NR_VBDA 0
+#endif
+#if NR_VBDA
+// NR_VBDA: V^T (and the RowMajor V) read through a buffer_reference to the same arena. From a
+// storage buffer LLPC gathers a column-major e4m3 fragment a byte at a time (eight
+// buffer_load_u8 a lane); from a global pointer it emits one global_load_tr_b64, the transposing
+// load ACO uses. The host passes the arena's device address in the push block (act_lo/act_hi).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer NrActRef { uint v[]; };
+#define NR_ACT_REF NrActRef(uvec2(pc.act_lo, pc.act_hi)).v
+#define NR_LOAD_A_COL_ACT(f, off, s) coopMatLoad(f, NR_ACT_REF, (off) / 4u, (s) / 4u, gl_CooperativeMatrixLayoutColumnMajor)
+#else
 #define NR_LOAD_A_COL_ACT(f, off, s) coopMatLoad(f, act_v4, (off) / 4u, (s) / 4u, gl_CooperativeMatrixLayoutColumnMajor)
+#endif
 layout(set = 0, binding = 1, std430) readonly buffer WgtF32  { float   wgt_f32[]; };
 // The same arena as binding 0, typed four e4m3 wide. The staging loop reads
 // sixteen *contiguous, sixteen-byte-aligned* bytes per head - `nr_at` keeps a
@@ -44,7 +59,17 @@ layout(set = 0, binding = 1, std430) readonly buffer WgtF32  { float   wgt_f32[]
 // turns sixteen `global_load_ubyte` into four vector loads. `fe4m3vec4` is the
 // spelling, and gemm1x1 records that ACO scalarises it back for SSBO *stores*;
 // whether it does for loads is the measurement this binding exists to make.
+// NR_VOUT_VEC: the output's eight contiguous bytes per lane and half go
+// out as two vec4 stores through this view (writable then) instead of eight
+// byte stores. Non-interleaved output only: mode bit 1 is ignored.
+#ifndef NR_VOUT_VEC
+#define NR_VOUT_VEC 0
+#endif
+#if NR_VOUT_VEC
+layout(set = 0, binding = 2, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_x4[]; };
+#else
 layout(set = 0, binding = 2, std430) NR_COH readonly buffer ActE4M3x4 { fe4m3vec4 act_x4[]; };
+#endif
 // Windows (LLPC): the same bytes as dwords; an e4m3 vector is loaded a byte per element.
 layout(set = 0, binding = 2, std430) NR_COH readonly buffer ActE4M3u { uint act_u2[]; };
 #define nr_act4(i) uintBitsToFloate4m3EXT(unpack8(act_u2[i]))
@@ -56,6 +81,7 @@ layout(push_constant) uniform Push {
     uint tokens;     // W * H, the real sequence length - 1980 at 1080p
     uint s_off;      // the 32 per-head f32 temperatures, as a float index
     uint mode;       // bit 0 cosine-normalise, bit 1 interleave, bit 2 quantise P
+    uint act_lo, act_hi;   // the activation arena's device address (NR_VBDA; host PushVAttn)
     NR_CHAIN_FIELDS
 } pc;
 
@@ -235,6 +261,10 @@ uint nr_out_ch(uint head, uint d) {
 #ifndef NR_VSPLIT_TAIL
 #define NR_VSPLIT_TAIL 0
 #endif
+// The denominator's cross-lane exchange once per chunk (vit_attn_vt_chunk.glsl).
+#ifndef NR_VLATE_SHUFFLE
+#define NR_VLATE_SHUFFLE 0
+#endif
 // NR_VQCLAMP: a query block past the last token loads the last live tile
 // instead of a zero fragment. Its logits, denominator and context are never
 // stored (the output loop skips q >= tokens), and the load-or-zero phi it
@@ -260,6 +290,16 @@ uint nr_out_ch(uint head, uint d) {
 #endif
 #if NR_VKMAN && !NR_VADDR
 #error "NR_VKMAN needs NR_VADDR's chunk base"
+#endif
+// NR_VKPERM: the denominator's key pairs (c, c+8) in one lane (vit_attn_vt_chunk.glsl).
+#ifndef NR_VKPERM
+#define NR_VKPERM 0
+#endif
+#if NR_VKPERM && !(NR_VKMAN && NR_VSPLIT_TAIL && !NR_VPB16 && !NR_VLATE_SHUFFLE)
+#error "NR_VKPERM: the shipping full-chunk body (NR_VKMAN, split tail, e4m3 P copy)"
+#endif
+#if NR_VKPERM
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #endif
 #ifndef NR_VPB16
 #define NR_VPB16 0
@@ -425,7 +465,13 @@ void main() {
     float den[NR_QB];
     for (int b = 0; b < NR_QB; ++b) den[b] = 0.0;
 #if NR_VKMAN
+#if NR_VKPERM
+    // K row r of a full chunk's tile reads key r with 4-7 and 8-11 swapped.
+    const uint vkr = (sl & 3u) | ((sl & 4u) << 1u) | ((sl & 8u) >> 1u);
+    const uint vkl4 = (vkr * 16u + (sl >> 4u) * 8u) >> 2;
+#else
     const uint vkl4 = ((sl & 15u) * 16u + (sl >> 4u) * 8u) >> 2;
+#endif
 #endif
 
     for (uint j0 = 0u; j0 < pc.tokens; j0 += uint(NR_KC)) {
@@ -486,6 +532,20 @@ void main() {
         const uint q = q0 + qb0 + b * 16u + col;
         if (q >= pc.tokens) continue;
         const NR_F16 inv = NR_F16(1.0 / max(den[b], floor_l));
+#if NR_VOUT_VEC && NR_VDUMP == 0
+        // The host must not set mode bit 1 (interleave) with this build.
+        {
+            for (uint n = 0u; n < 2u; ++n) {
+                NR_E4M3 qv[8];
+                for (int c = 0; c < 8; ++c)
+                    qv[c] = nr_quant_e4m3(NR_F16(NR_F16(ctx[b][n][c]) * inv));
+                const uint o4 = nr_at(pc.o_off, q, qbase + n * 16u + row0, uint(NR_C)) >> 2;
+                act_x4[o4] = fe4m3vec4(qv[0], qv[1], qv[2], qv[3]);
+                act_x4[o4 + 1u] = fe4m3vec4(qv[4], qv[5], qv[6], qv[7]);
+            }
+            continue;
+        }
+#endif
         for (uint n = 0u; n < 2u; ++n)
             for (int c = 0; c < ctx[b][n].length(); ++c) {
                 const uint d0 = n * 16u + row0 + uint(c);

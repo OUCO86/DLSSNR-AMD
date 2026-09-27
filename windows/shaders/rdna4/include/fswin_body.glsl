@@ -56,7 +56,7 @@
     for(int n=0;n<2;++n) uacc[n]=NR_ACC_ZERO;
     for(int k=0;k<4;++k) {
         for(int j=0;j<8;++j)
-            upsrc[k][j]=act_e4m3[pc.blend_p_off+(ups_tile*4u+uint(k))*256u+ups_in_slot*16u+rbase+uint(j)];
+            upsrc[k][j]=NR_ACT_B8(pc.blend_p_off+(ups_tile*4u+uint(k))*256u+ups_in_slot*16u+rbase, j);
         for(int n=0;n<2;++n) {
             NR_FRAG_A w;
             NR_LOAD_A(w,wgt_e4m3,pc.ups_weight_off+uint(n*4+k)*256u,16u);
@@ -71,7 +71,7 @@
 #else
     for(int k=0;k<4;++k)
         for(int j=0;j<8;++j)
-            upsrc[k][j]=act_e4m3[pc.blend_p_off+(ups_tile*4u+uint(k))*256u+ups_in_slot*16u+rbase+uint(j)];
+            upsrc[k][j]=NR_ACT_B8(pc.blend_p_off+(ups_tile*4u+uint(k))*256u+ups_in_slot*16u+rbase, j);
     for(int n=0;n<2;++n) {
         NR_FRAG_ACC acc=NR_ACC_ZERO;
         for(int k=0;k<4;++k) {
@@ -111,7 +111,7 @@
     for(int k=0;k<2*NR_CF;++k) {
         NR_FRAG_B us;
         for(int j=0;j<8;++j)
-            us[j]=act_e4m3[pc.blend_p_off+(ups_tile*uint(2*NR_CF)+uint(k))*256u+ups_in_slot*16u+rbase+uint(j)];
+            us[j]=NR_ACT_B8(pc.blend_p_off+(ups_tile*uint(2*NR_CF)+uint(k))*256u+ups_in_slot*16u+rbase, j);
         for(int n=0;n<NR_DF;++n) {
             const uint nf=uint(nrhw_h*NR_DF+n);
             NR_FRAG_A w;
@@ -133,7 +133,7 @@
             const uint token=ups_tile*16u+ups_in_slot;
             const uint ch=uint(k)*16u+rbase+uint(j);
             if(pc.blend_o_off==0u) {
-                upsrc[k][j]=act_e4m3[pc.blend_p_off+(ups_tile*uint(2*NR_CF)+uint(k))*256u+ups_in_slot*16u+rbase+uint(j)];
+                upsrc[k][j]=NR_ACT_B8(pc.blend_p_off+(ups_tile*uint(2*NR_CF)+uint(k))*256u+ups_in_slot*16u+rbase, j);
             } else {
                 // Exact byte view from upsample_view.comp, fused into gather.
                 const uint W=pc.blend_o_off,H=pc.blend_mode;
@@ -150,7 +150,7 @@
             }
         }
 #else
-            upsrc[k][j]=act_e4m3[pc.blend_p_off+(ups_tile*uint(2*NR_CF)+uint(k))*256u+ups_in_slot*16u+rbase+uint(j)];
+            upsrc[k][j]=NR_ACT_B8(pc.blend_p_off+(ups_tile*uint(2*NR_CF)+uint(k))*256u+ups_in_slot*16u+rbase, j);
 #endif
     for(int n=0;n<NR_DF;++n) {
         const uint nf=uint(nrhw_h*NR_DF+n);
@@ -217,7 +217,7 @@
             for (int d = 0; d < NR_DF; ++d) {
                 const uint k = uint(nrhw_h * NR_DF + d);
                 NR_FRAG_B src;
-                NR_LOAD_B(src, act_e4m3, tbase[m] + k * 256u, 16u);
+                NR_LOAD_B_ACT(src, tbase[m] + k * 256u, 16u);
                 NR_FRAG_E4M3 dst;
                 for (int j = 0; j < 8; ++j) dst[j] = src[j];
                 if (nr_tile_oob(uint(m)))
@@ -247,7 +247,7 @@
             // v_fma_f16 a channel, which v_pk_fma_f16 rounds the same way per half.
             {
                 const uint saddr=pc.blend_s_off+(stile*uint(NR_CF)+k)*256u+slot*16u+rbase;
-                const fe4m3vec4 sv4[2]={blend_e4m3x4[saddr/4u], blend_e4m3x4[saddr/4u+1u]};
+                const fe4m3vec4 sv4[2]={NR_BLEND_X4(saddr/4u), NR_BLEND_X4(saddr/4u+1u)};
                 const uint local_slot=((q>>1u)*2u+dy/2u)*4u+(q&1u)*2u+dx/2u;
                 for(int j=0;j<8;j+=2) {
                     const uint ch=k*16u+rbase+uint(j);
@@ -262,6 +262,8 @@
             }
             if(false)
 #endif
+            {
+            NR_F16 blend_h[8];
             for(int j=0;j<8;++j) {
                 const uint ch=k*16u+rbase+uint(j);
 #ifdef NR_WIDE_UPS_PROJECT
@@ -270,13 +272,19 @@
 #else
                 NR_F16 pv=act_f16[pc.blend_p_off/2u+(itile*uint(NR_CF)+k)*256u+islot*16u+rbase+uint(j)];
 #endif
-                NR_F16 sv=NR_F16(act_e4m3[pc.blend_s_off+(stile*uint(NR_CF)+k)*256u+slot*16u+rbase+uint(j)]);
+                NR_F16 sv=NR_F16(NR_ACT_B8(pc.blend_s_off+(stile*uint(NR_CF)+k)*256u+slot*16u+rbase, j));
                 NR_F16 sp=NR_F16(sv*wgt_f16[pc.blend_g_off+ch]);
                 // Native wide path quantizes the half blend before residual/MLP.
-                src[j]=nr_quant_e4m3(NR_F16(pv+sp));
+                blend_h[j]=NR_F16(pv+sp);
+            }
+            // Windows: quantised four at a time (nr_quant4_h), the same bytes.
+            for(int j=0;j<8;j+=4) {
+                const fe4m3vec4 q4=nr_quant4_h(f16vec4(blend_h[j],blend_h[j+1],blend_h[j+2],blend_h[j+3]));
+                src[j]=q4.x;src[j+1]=q4.y;src[j+2]=q4.z;src[j+3]=q4.w;
+            }
             }
 #else
-            NR_LOAD_B(src, act_e4m3, tbase[m] + k * 256u, 16u);
+            NR_LOAD_B_ACT(src, tbase[m] + k * 256u, 16u);
 #endif
             NR_FRAG_E4M3 dst;
             for (int j = 0; j < 8; ++j) dst[j] = src[j];
@@ -314,7 +322,7 @@
             // way per half. e4m3 -> f16 is exact, so the pair pack loses nothing.
             {
                 const uint saddr=pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase;
-                const fe4m3vec4 sv4[2]={blend_e4m3x4[saddr/4u], blend_e4m3x4[saddr/4u+1u]};
+                const fe4m3vec4 sv4[2]={NR_BLEND_X4(saddr/4u), NR_BLEND_X4(saddr/4u+1u)};
                 for(int j=0;j<8;j+=2) {
                     const uint ch=uint(k)*16u+rbase+uint(j);
 #ifdef NR_FUSED_UPS_PROJECT
@@ -346,7 +354,7 @@
 #else
                 NR_F16 pv=act_f16[pc.blend_p_off/2u+(itile*uint(NR_CF)+uint(k))*256u+islot*16u+rbase+uint(j)];
 #endif
-                NR_F16 sv=NR_F16(act_e4m3[pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase+uint(j)]);
+                NR_F16 sv=NR_F16(NR_ACT_B8(pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase, j));
                 NR_F16 sp=NR_F16(sv*wgt_f16[pc.blend_g_off+ch]);
                 xh[m][k][j]=NR_F16(pv+sp);
             }
@@ -370,8 +378,8 @@
             const uint saddr=pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase;
             fe4m3vec4 pv4[2], sv4[2];
             for (int v=0;v<2;++v) {
-                pv4[v]=blend_e4m3x4[paddr/4u+uint(v)];
-                sv4[v]=blend_e4m3x4[saddr/4u+uint(v)];
+                pv4[v]=NR_BLEND_X4(paddr/4u+uint(v));
+                sv4[v]=NR_BLEND_X4(saddr/4u+uint(v));
             }
 #endif
 #if NR_POST_BLEND_PK && NR_BLEND_VECTOR_LOAD
@@ -406,8 +414,8 @@
                 const NR_F16 pv=NR_F16(pv4[j/4][j%4]);
                 const NR_F16 sv=NR_F16(sv4[j/4][j%4]);
 #else
-                const NR_F16 pv=NR_F16(act_e4m3[pc.blend_p_off+(itile*uint(NR_CF)+uint(k))*256u+islot*16u+rbase+uint(j)]);
-                const NR_F16 sv=NR_F16(act_e4m3[pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase+uint(j)]);
+                const NR_F16 pv=NR_F16(NR_ACT_B8(pc.blend_p_off+(itile*uint(NR_CF)+uint(k))*256u+islot*16u+rbase, j));
+                const NR_F16 sv=NR_F16(NR_ACT_B8(pc.blend_s_off+(stile*uint(NR_CF)+uint(k))*256u+slot*16u+rbase, j));
 #endif
                 NR_F16 mp=NR_F16(pv*wgt_f16[pc.blend_g_off+uint(NR_C)+ch]);
                 NR_F16 sp=NR_F16(sv*wgt_f16[pc.blend_g_off+ch]);
@@ -447,7 +455,7 @@
 #endif
             }
 #else
-            NR_LOAD_B(xb[m][k], act_e4m3, tbase[m] + uint(k) * 256u, 16u);
+            NR_LOAD_B_ACT(xb[m][k], tbase[m] + uint(k) * 256u, 16u);
 #endif
 #if NR_IMAGE
 #if NR_OOB_BRANCH && defined(NR_INPUT_F16)
@@ -882,7 +890,13 @@
 #define NR_Y(m, n, c) float(NR_YQ(m, n)[c])
 #endif
 #else
+#if NR_Q32_STAGE
+    // Windows: kept in f32. RADV's NIR deletes the f32 -> f16 -> f32 round trip of every use,
+    // so linux/ never rounded it; LLPC keeps it (two converts a value). f32 >= native precision.
+    float yh[NR_MF][NR_CF][8];
+#else
     NR_FRAG_ACC16 yh[NR_MF][NR_CF];     // ... and the wide one, for the skip
+#endif
 #define NR_Y(m, n, c) float(yh[m][n][c])
 #endif
 #if NR_WPF
@@ -1020,7 +1034,11 @@
         // the *quantised* value is what the attention skip adds back.
 #if NR_QUANT_PAIRED
         for (int m = 0; m < NR_MF; ++m) NR_MG(m) {
+#if NR_Q32_STAGE
+            float requantized[8];
+#else
             NR_F16 requantized[8];
+#endif
 #else
         for (int m = 0; m < NR_MF; ++m)
 #endif
@@ -1054,19 +1072,27 @@
                     + wgt_f32[pc.rs_off + uint(n) * 16u + rbase + uint(c)]
                       * float(NR_XB(m,n)[c]);
 #endif
-#if NR_QUANT_PAIRED
+#if NR_QUANT_PAIRED && NR_Q32_STAGE
+                requantized[c] = v;
+#elif NR_QUANT_PAIRED
                 requantized[c] = NR_F16(v);
 #else
                 NR_YQ(m, n)[c] = nr_quant_e4m3(NR_F16(v));
 #endif
-#if NR_HEADS == 1
+#if NR_HEADS == 1 && NR_Q32_STAGE
+                yh[m][n][c] = v;
+#elif NR_HEADS == 1
                 yh[m][n][c] = NR_F16(v);
 #endif
             }
 #endif
 #if NR_QUANT_PAIRED
             for (int c=0;c<8;c+=2) {
+#if NR_Q32_STAGE
+                NR_QPAIR_T q=nr_quant_pair32(vec2(requantized[c],requantized[c+1]));
+#else
                 NR_QPAIR_T q=NR_QP_YQ(f16vec2(requantized[c],requantized[c+1]));
+#endif
                 NR_YQ(m, n)[c]=q.x; NR_YQ(m, n)[c+1]=q.y;
 #if NR_V_SWAP && !NR_HWAVES
                 yqa[m][NR_YN][c]=q.x; yqa[m][NR_YN][c+1]=q.y;
@@ -1795,7 +1821,9 @@
                     // they did not before (the P column of the ledger is a
                     // C=32 measurement and C=32 is the one width with no head
                     // split).
-#if NR_PROB_BOUNDED
+#if NR_PROB_BOUNDED && NR_PROB_PK
+                    fe4m3vec2 q = fe4m3vec2(pq2[j][c] * f16vec2(NR_F16(inv)));
+#elif NR_PROB_BOUNDED
                     fe4m3vec2 q = fe4m3vec2(NR_N2_P(x,y));
 #else
                     fe4m3vec2 q = nr_quant_pair(NR_N2_P(x, y));
@@ -1932,7 +1960,9 @@
 #else
                 float x=float(pq2[m][j][c].x)*inv;
                 float y=float(pq2[m][j][c].y)*inv;
-#if NR_PROB_BOUNDED
+#if NR_PROB_BOUNDED && NR_PROB_PK
+                NR_PV_QT q=fe4m3vec2(pq2[m][j][c] * f16vec2(NR_F16(inv)));
+#elif NR_PROB_BOUNDED
                 NR_PV_QT q=fe4m3vec2(NR_N2_P(x,y));
 #else
                 NR_PV_QT q=NR_QP_P(NR_N2_P(x,y));
@@ -2286,6 +2316,16 @@
 #else
             NR_FRAG_E4M3 of;
             NR_F16 wide[8];
+#if NR_Q32_STAGE
+            float widef[8];   // the pre-narrowing values, for the quantiser (see yh)
+#endif
+#if NR_Q32_STAGE && NR_Q32_POOL
+            // The pool from them too: -5..-7% instructions in the DS runs, no time gained on
+            // Windows and 48.1 vs 48.6 dB to Linux (2026-09-28); off.
+#define NR_WIDE_F(c) widef[c]
+#else
+#define NR_WIDE_F(c) float(wide[c])
+#endif
 #if NR_POOL_PACKED == 3 || NR_POOL_DPP16 >= 6
             // The pre-narrowing f32 values. The shipped scalar pool reads
             // float(wide[c]), which ACO folds back to exactly these.
@@ -2300,6 +2340,18 @@
 #endif
                     ;
                 wide[c] = NR_F16(wf[c]);
+#if NR_Q32_STAGE
+                widef[c] = wf[c];
+#endif
+#else
+#if NR_Q32_STAGE
+                widef[c] = a[m][c]
+#if !NR_PTX_ACC
+                    + wgt_f32[pc.ars_off + uint(n) * 16u + rbase + uint(c)]
+                      * NR_Y(m, n, c)
+#endif
+                    ;
+                wide[c] = NR_F16(widef[c]);
 #else
                 wide[c] = NR_F16(a[m][c]
 #if !NR_PTX_ACC
@@ -2308,10 +2360,15 @@
 #endif
                     );
 #endif
+#endif
 #if NR_QUANT_PAIRED
             }
             for (int c=0;c<8;c+=2) {
+#if NR_Q32_STAGE
+                fe4m3vec2 q=nr_quant_pair32(vec2(widef[c],widef[c+1]));
+#else
                 fe4m3vec2 q=nr_quant_pair(f16vec2(wide[c],wide[c+1]));
+#endif
                 of[c]=q.x; of[c+1]=q.y;
 #else
                 of[c] = nr_quant_e4m3(wide[c]);
@@ -2390,7 +2447,7 @@
                 // the same float(wide[]) values the scalar chain adds (ACO keeps
                 // those unrounded), narrowed once per pair; the remaining
                 // half-precision steps are the scalar chain's own roundings.
-                const float a0 = float(wide[c]), a1 = float(wide[c+1]);
+                const float a0 = NR_WIDE_F(c), a1 = NR_WIDE_F(c+1);
                 const f16vec2 pr = f16vec2(a0 + subgroupShuffleXor(a0, 1u),
                                            a1 + subgroupShuffleXor(a1, 1u));
 #else
@@ -2447,7 +2504,7 @@
             // scalar chain does: with a single use ACO fuses f2f16(a + b) into
             // v_fma_mixlo (one rounding where the chain has two).
             for (int c=0;c<8;c+=2) {
-                const float v0 = float(wide[c]), v1 = float(wide[c+1]);
+                const float v0 = NR_WIDE_F(c), v1 = NR_WIDE_F(c+1);
                 const float s0 = v0 + subgroupShuffleXor(v0,1u), s1 = v1 + subgroupShuffleXor(v1,1u);
                 const f16vec2 pr = f16vec2(NR_F16(s0), NR_F16(s1));
                 const f16vec2 sm = pr + f16vec2(NR_F16(subgroupShuffleXor(s0,4u)),
@@ -2457,7 +2514,7 @@
             }
 #else
             for (int c=0;c<8;++c) {
-                float v = float(wide[c]);
+                float v = NR_WIDE_F(c);
                 NR_F16 pair = NR_F16(v + subgroupShuffleXor(v,1u));
 #if NR_POOL_DPP16 & 1
                 // Diagnostic: shuffling the half itself saves one instruction a
@@ -2584,7 +2641,7 @@
             }
 #else
             for (int c=0;c<8;++c) {
-                float v = float(wide[c]);
+                float v = NR_WIDE_F(c);
                 NR_F16 pair = NR_F16(v + subgroupShuffleXor(v,1u));
                 NR_F16 sum = NR_F16(pair + NR_F16(subgroupShuffleXor(float(pair),4u)));
                 NR_F16 mean = NR_F16(sum * NR_F16(0.25));
@@ -2708,12 +2765,9 @@
 #if NR_DS_QPAIR
                 // The same per-component mode-4 conversion, two at a time
                 // (one v_cvt_pk_fp8_f32 a pair instead of one a value + perms).
-                const fe4m3vec2 q0 = nr_quant_pair(f16vec2(outv[0], outv[1]));
-                const fe4m3vec2 q1 = nr_quant_pair(f16vec2(outv[2], outv[3]));
-                const fe4m3vec2 q2 = nr_quant_pair(f16vec2(outv[4], outv[5]));
-                const fe4m3vec2 q3 = nr_quant_pair(f16vec2(outv[6], outv[7]));
-                act_e4m3x4[ob]      = fe4m3vec4(q0.x, q0.y, q1.x, q1.y);
-                act_e4m3x4[ob + 1u] = fe4m3vec4(q2.x, q2.y, q3.x, q3.y);
+                // Windows: four at a time (nr_quant4_h), the same bytes.
+                act_e4m3x4[ob]      = nr_quant4_h(f16vec4(outv[0], outv[1], outv[2], outv[3]));
+                act_e4m3x4[ob + 1u] = nr_quant4_h(f16vec4(outv[4], outv[5], outv[6], outv[7]));
 #else
                 act_e4m3x4[ob]      = fe4m3vec4(nr_quant_e4m3(outv[0]), nr_quant_e4m3(outv[1]),
                                                 nr_quant_e4m3(outv[2]), nr_quant_e4m3(outv[3]));

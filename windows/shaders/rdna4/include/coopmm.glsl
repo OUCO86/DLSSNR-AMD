@@ -380,6 +380,19 @@ NR_E4M3 nr_quant_e4m3(float v) {
 // Mesa 26.2.2, C=32: mode 0 has 768 and no `s_setreg`, mode 4 has **0
 // `v_maxmin_num_f32` and 343 `s_setreg_imm32_b32`** for its 384
 // `v_cvt_pk_fp8_f32`, mode 5 has neither.
+// NR_ABLATE_CVT (diagnostic, wrong output, fswin_t pipelines only - they enable int8): the byte
+// taken from the value's top bits instead of a conversion, so no MODE write, no convert and no
+// clamp. With NR_ABLATE_QUANT (clamp dropped, convert kept) it prices the quantiser on LLPC.
+#ifndef NR_ABLATE_CVT
+#define NR_ABLATE_CVT 0
+#endif
+#if NR_ABLATE_CVT
+fe4m3vec4 nr_fake4(vec4 x) {
+    const uvec4 u = floatBitsToUint(x) >> 24u;
+    return fe4m3vec4(uintBitsToFloate4m3EXT(uint8_t(u.x)), uintBitsToFloate4m3EXT(uint8_t(u.y)),
+                     uintBitsToFloate4m3EXT(uint8_t(u.z)), uintBitsToFloate4m3EXT(uint8_t(u.w)));
+}
+#endif
 #if NR_QUANT_MODE == 4
 NR_E4M3 nr_quant_e4m3(float v) {
 #if defined(NR_QUANT_EXPLICIT) && NR_QUANT_EXPLICIT
@@ -508,6 +521,39 @@ fe4m3vec2 nr_quant_pair32(vec2 x) {
 #endif
 }
 #define NR_HAVE_QUANT_PAIR32 1
+#if NR_QUANT_EXPLICIT && !NR_ABLATE_QUANT
+// Two pairs as one four-wide conversion, element for element nr_quant_pair / nr_quant_pair32:
+// LLPC writes MODE once and fills one dword with two converts (op_sel), where two pairs cost
+// two MODE writes and a shift + and-or to pack. windows/build/quad_quant_glsl.py rewrites the
+// pair loops to these.
+fe4m3vec4 nr_quant_quad(f16vec2 a, f16vec2 b) {
+#if NR_ABLATE_CVT
+    return nr_fake4(vec4(vec2(a), vec2(b)));
+#endif
+    const vec4 x = vec4(vec2(a), vec2(b));
+    return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
+}
+fe4m3vec4 nr_quant_quad32(vec2 a, vec2 b) {
+#if NR_ABLATE_CVT
+    return nr_fake4(vec4(a, b));
+#endif
+    const vec4 x = vec4(a, b);
+    return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
+}
+#elif NR_QUANT_EXPLICIT && NR_ABLATE_QUANT
+// Diagnostic: the quad forms without the range step (wrong output; prices the clamp).
+fe4m3vec4 nr_quant_quad(f16vec2 a, f16vec2 b) { return fe4m3vec4(vec4(vec2(a), vec2(b))); }
+fe4m3vec4 nr_quant_quad32(vec2 a, vec2 b) { return fe4m3vec4(vec4(a, b)); }
+#endif
+#endif
+
+// Two plain (in-range) conversions as one four-wide one; windows/build/quad_quant_glsl.py.
+#if NR_ABLATE_CVT
+fe4m3vec4 nr_convert_quad(f16vec2 a, f16vec2 b) { return nr_fake4(vec4(vec2(a), vec2(b))); }
+fe4m3vec4 nr_convert_quad(vec2 a, vec2 b) { return nr_fake4(vec4(a, b)); }
+#else
+fe4m3vec4 nr_convert_quad(f16vec2 a, f16vec2 b) { return fe4m3vec4(f16vec4(a, b)); }
+fe4m3vec4 nr_convert_quad(vec2 a, vec2 b) { return fe4m3vec4(vec4(a, b)); }
 #endif
 
 // The same conversion with the **saturation** removed and nothing else: no
@@ -533,6 +579,30 @@ fe4m3vec2 nr_quant_pair32(vec2 x) {
     return fe4m3vec2(nr_quant_e4m3(NR_F16(x.x)), nr_quant_e4m3(NR_F16(x.y)));
 }
 #endif
+
+// Four (two) nr_quant_e4m3(NR_F16) as one conversion, the same bytes in every mode. LLPC makes
+// each scalar conversion its own MODE write + convert + byte packing; four at once is one MODE
+// write and two converts into one dword (windows/build/quad_quant_glsl.py has the why).
+fe4m3vec4 nr_quant4_h(f16vec4 v) {
+#if NR_ABLATE_CVT
+    return nr_fake4(vec4(v));
+#endif
+#if NR_QUANT_MODE == 1 || NR_QUANT_MODE == 5
+    return fe4m3vec4(clamp(v, f16vec4(-448.0), f16vec4(448.0)));
+#elif NR_QUANT_MODE == 4 && defined(NR_QUANT_EXPLICIT) && NR_QUANT_EXPLICIT && !NR_ABLATE_QUANT
+    const vec4 x = vec4(v);
+    return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0);
+#else
+    return fe4m3vec4(nr_quant_e4m3(v.x), nr_quant_e4m3(v.y), nr_quant_e4m3(v.z), nr_quant_e4m3(v.w));
+#endif
+}
+fe4m3vec2 nr_quant2_h(f16vec2 v) {
+#if NR_QUANT_MODE == 1 || NR_QUANT_MODE == 5
+    return fe4m3vec2(clamp(v, f16vec2(-448.0), f16vec2(448.0)));
+#else
+    return fe4m3vec2(nr_quant_e4m3(v.x), nr_quant_e4m3(v.y));
+#endif
+}
 
 // MpCubicSiluActivation, recovered exactly from 1936 call sites across five
 // modules. Verified inside the fused Swin block, and again on

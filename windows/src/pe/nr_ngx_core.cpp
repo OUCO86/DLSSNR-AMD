@@ -46,6 +46,7 @@
 #include "nr_ngx_abi.hpp"
 #include "nr_pe_crash.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_pe_optifix.hpp"
 
 #include <cstring>
 #include <map>
@@ -1164,6 +1165,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             if (*c == '\\' || *c == '/') name = c + 1;
         nr::pe::log("[nr] %s attached (build %s, %s %s), log %s", name, NR_BUILD_STAMP,
                     __DATE__, __TIME__, nr::pe::log_path());
+        // OptiScaler loads this module during its own initialisation, before any Vulkan device
+        // exists: the one moment its device hook can still be corrected. See nr_pe_optifix.hpp.
+        nr::pe::fix_optiscaler();
     }
     return TRUE;
 }

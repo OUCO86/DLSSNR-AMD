@@ -2,6 +2,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -60,6 +61,13 @@ struct HostDevice {
     // queries through their next instance dispatch, not the outer loader.
     // Null for ordinary application-owned (outer-loader) handles.
     PFN_vkGetInstanceProcAddr physical_dispatch{};
+    // The host API's queue lock, taken by the constructor around each of its
+    // submits only. Empty: the caller serialises the whole construction.
+    std::function<void()> queue_lock, queue_unlock;
+    // bufferDeviceAddress is enabled on `device` (vkd3d-proton's always; DXVK's and a Vulkan
+    // game's when the device watch added the network's features). The graph then reads the
+    // activation arena through a buffer_reference where that is faster (Windows network only).
+    bool buffer_device_address = false;
 };
 
 struct RuntimeConfig {
@@ -122,6 +130,10 @@ struct ColourFrame {
     VkAccessFlags before_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     VkPipelineStageFlags after_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkAccessFlags after_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    // What the image may be used for, when the caller knows. Zero = unknown.
+    // With VK_IMAGE_USAGE_SAMPLED_BIT the engine path samples the colour and
+    // depth in place instead of copying them (same values, no copy).
+    VkImageUsageFlags usage = 0;
 };
 
 // Explicit engine/integration-provided mask. Linear RGBA32F, TRANSFER_SRC,

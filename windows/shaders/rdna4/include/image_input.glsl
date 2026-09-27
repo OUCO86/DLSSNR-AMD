@@ -53,29 +53,7 @@ layout(set=0,binding=6) uniform sampler2D nr_tex;
 #endif
 shared NR_F16 input_features[4*256];
 
-// Same recovered PCG/Box-Muller stream as img_in.comp. Noise coordinates stay
-// in the padded working domain; only texture coordinates reflect source edges.
-float nr_g0,nr_g1,nr_g2;
-uint nr_pcg(uint v) {
-    v=(v>>((v>>28)+4u))^v;
-    v*=0x108EF2D9u;
-    return v;
-}
-float nr_u(uint stream) {
-    const uint t=nr_pcg(stream);
-    return float(((t>>30)^(t>>8))+1u)*5.9604644775390625e-08;
-}
-void nr_gauss3(uint x,uint y,uint seed) {
-    const uint base=(x*0x8DA6B343u)^(seed*0x9E3779B9u)^(y*0xD8163841u)^0x243F6A88u;
-    const uint t=nr_pcg(base),h=(t>>22)^t;
-    const float uA=nr_u(h*0x2C9277B5u+0xAC564B05u);
-    const float uB=nr_u(h*0xFA6DC5F9u+0x4712A88Eu);
-    const float uC=nr_u(h*0xCAA5B80Du+0x21DD796Bu);
-    const float uD=nr_u(h*0x83232C31u+0x3463E0ACu);
-    const float rA=sqrt(-2.0*log(uA)),rC=sqrt(-2.0*log(uC));
-    const float a1=uB*6.28318530718,a2=uD*6.28318530718;
-    nr_g0=rA*cos(a1);nr_g1=rA*sin(a1);nr_g2=rC*cos(a2);
-}
+#include "image_noise.glsl"
 void nr_prepare_features() {
     // One pass a pixel of the 8x8 group, whatever the wave count. The trip
     // count is a *compile-time* 64/NR_THREADS and not a `< 64u` test, so at two
@@ -92,15 +70,36 @@ void nr_prepare_features() {
     const int sy=y<sh?int(y):2*int(sh)-int(y)-2;
     const vec2 uv=vec2((float(sx)+0.5)/float(sw),(float(sy)+0.5)/float(sh));
     const vec4 rgba=textureLod(nr_tex,uv,0.0);
+#if NR_HALF_RTE
+    // f32 sample, rounded to nearest by the conversion (fswin_t.comp NR_HALF_RTE).
+    const f16vec3 centered=f16vec3(f16vec3(max(rgba.rgb,vec3(-3.4028234663852886e38)))-f16vec3(0.5));
+#else
     const f16vec3 centered=f16vec3(f16vec3(rgba.rgb)-f16vec3(0.5));
+#endif
     const vec3 cn=vec3(f16vec3(centered*NR_F16(0.125)));
+    float f[16];
+#if NR_NOISE_FIELD
+    // The noise features are a fixed function of (x, y, seed) and the noise
+    // gain, so the host computes them once at build (noise_field.comp, the same
+    // code below) into the weight arena, [row][pixel] f16 x4 over the padded
+    // working grid, and every frame reads them back: two dwords a pixel instead
+    // of a 32-bit hash with four quarter-rate multiplies and four
+    // transcendentals (1080p 19 us, 4K 87 us a frame). Offset 0: compute here.
+    [[dont_flatten]] if (pc.image_noise_off != 0u) {
+        const uint nr_ni = pc.image_noise_off + (y * (gl_NumWorkGroups.x * 8u) + x) * 2u;
+        const vec2 nr_n01 = unpackHalf2x16(wgt_u32[nr_ni]);
+        const vec2 nr_n2 = unpackHalf2x16(wgt_u32[nr_ni + 1u]);
+        f[0]=nr_n01.x;f[1]=nr_n01.y;f[2]=nr_n2.x;
+    } else
+#endif
+    {
 #if NR_DIAG_NONOISE
     nr_g0=nr_g1=nr_g2=0.0;  // diagnostic only: prices the noise stream
 #else
     nr_gauss3(x,y,pc.image_seed);
 #endif
-    float f[16];
     f[0]=pc.image_noise*nr_g0;f[1]=pc.image_noise*nr_g1;f[2]=pc.image_noise*nr_g2;
+    }
     f[3]=pc.image_constant;
     f[4]=cn.x;f[5]=cn.y;f[6]=cn.z;
     // Slots 7..9 are the history colour. The original seeds them with the

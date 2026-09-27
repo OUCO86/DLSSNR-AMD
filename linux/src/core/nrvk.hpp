@@ -670,6 +670,7 @@ struct Kernel {
     VkPipeline pipeline{};
     VkDescriptorPool pool{};
     VkDescriptorSet set{};
+    uint32_t push_range{};   // the layout's push constant bytes
 
     // **Image bindings follow the buffers**, in set 0, continuing the binding
     // numbers. The two image adapters are the only layers that need them - a
@@ -684,6 +685,7 @@ struct Kernel {
                 const std::vector<VkBuffer>& bindings, uint32_t push_bytes,
                 const std::vector<Context::Image*>& images = {}) {
         device = ctx.device;
+        push_range = push_bytes;
         const uint32_t nb = uint32_t(bindings.size());
         const uint32_t ni = uint32_t(images.size());
         const uint32_t n = nb + ni;

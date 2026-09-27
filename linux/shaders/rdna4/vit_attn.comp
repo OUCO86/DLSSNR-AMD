@@ -40,6 +40,7 @@ layout(set = 0, binding = 2, std430) NR_COH buffer ActE4M3x4 { fe4m3vec4 act_x4[
 layout(set = 0, binding = 2, std430) NR_COH readonly buffer ActE4M3x4 { fe4m3vec4 act_x4[]; };
 #endif
 
+#define NR_TC_WBIND 1   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
 layout(push_constant) uniform Push {
     uint x_off;      // the QKV output: [tokens][3*NR_C], e4m3, tile-blocked
@@ -48,6 +49,7 @@ layout(push_constant) uniform Push {
     uint s_off;      // the 32 per-head f32 temperatures, as a float index
     uint mode;       // bit 0 cosine-normalise, bit 1 interleave, bit 2 quantise P
     NR_CHAIN_FIELDS
+    NR_TCHAIN_FIELDS
 } pc;
 
 uint nr_at(uint base, uint token, uint ch, uint C) {
@@ -256,6 +258,16 @@ uint nr_out_ch(uint head, uint d) {
 #if NR_VKMAN && !NR_VADDR
 #error "NR_VKMAN needs NR_VADDR's chunk base"
 #endif
+// NR_VKPERM: the denominator's key pairs (c, c+8) in one lane (vit_attn_vt_chunk.glsl).
+#ifndef NR_VKPERM
+#define NR_VKPERM 0
+#endif
+#if NR_VKPERM && !(NR_VKMAN && NR_VSPLIT_TAIL && !NR_VPB16 && !NR_VLATE_SHUFFLE)
+#error "NR_VKPERM: the shipping full-chunk body (NR_VKMAN, split tail, e4m3 P copy)"
+#endif
+#if NR_VKPERM
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
 #ifndef NR_VPB16
 #define NR_VPB16 0
 #endif
@@ -348,6 +360,7 @@ shared float   lds_ki[NR_KC];          // per-key 1/||k||
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
+    NR_TC_PROLOGUE
     const uint q0 = gl_WorkGroupID.x * uint(NR_QT);
     const uint head = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
@@ -420,7 +433,13 @@ void main() {
     float den[NR_QB];
     for (int b = 0; b < NR_QB; ++b) den[b] = 0.0;
 #if NR_VKMAN
+#if NR_VKPERM
+    // K row r of a full chunk's tile reads key r with 4-7 and 8-11 swapped.
+    const uint vkr = (sl & 3u) | ((sl & 4u) << 1u) | ((sl & 8u) >> 1u);
+    const uint vkl4 = (vkr * 16u + (sl >> 4u) * 8u) >> 2;
+#else
     const uint vkl4 = ((sl & 15u) * 16u + (sl >> 4u) * 8u) >> 2;
+#endif
 #endif
 
     for (uint j0 = 0u; j0 < pc.tokens; j0 += uint(NR_KC)) {
@@ -796,5 +815,7 @@ void main() {
             }
 #endif  // NR_VTRANS
     nr_chain_signal()
+    // NR_TCHAIN: this head's columns of the query tile's token tiles are written.
+    nr_tchain_signal_wave(q0 / 16u, min(uint(NR_QT) / 16u, (pc.tokens + 15u) / 16u - q0 / 16u))
     NR_PROF_END(pc.o_off)
 }

@@ -16,10 +16,11 @@ Install
 -------
     bash install.sh "/path/to/steamapps/common/<game folder>" --dll /path/to/nvngx_dlssnr_310.8.0.zip
 
-The folder is the one that holds the game's exe. The script lists the routes; you can also
-name one after the folder:
+The folder is the one that holds the game's exe (the one that actually runs - for Unreal Engine
+games it is <project>/Binaries/Win64, not the top folder with the launcher). The script lists
+the routes; you can also name one after the folder:
 
-    optiscaler  for games with a DLSS option. OptiScaler does the upscaling and frame
+    optiscaler  for games with a DLSS, FSR or XeSS option. OptiScaler does the upscaling and frame
                 generation, this project is its DLSS-NR backend. 64-bit package only.
     reshade     for D3D10/11/12 games without a usable upscaler. ReShade + VORT provide
                 the motion vectors.
@@ -65,8 +66,8 @@ plus the route's own files (OptiScaler's or ReShade's DLLs, ini files, shaders).
 
 Use
 ---
-optiscaler: turn on DLSS in the game; Insert opens the OptiScaler menu, the NR settings are on
-            the DLSS Neural Rendering page.
+optiscaler: turn on DLSS, FSR or XeSS in the game; Insert opens the OptiScaler menu, the NR
+            settings are on the DLSS Neural Rendering page.
             If the NR page keeps showing "Waiting for the upscaler to run", try
             [Spoofing] Dxgi=false in OptiScaler.ini (Dying Light: The Beast has needed it).
 reshade / vulkan / dx9: Home opens ReShade, the settings are on the Add-ons page; the same

@@ -295,6 +295,9 @@
 #error "NR_POOL needs the per-element epilogue; NR_EPI_WMMA has no lds_e stage"
 #endif
 
+#ifndef NR_GEMM_REMAP_PC
+#define NR_GEMM_REMAP_PC 0
+#endif
 #ifndef NR_ABLATE_STAGE
 #define NR_ABLATE_STAGE 0       // 1: stage constants, no global load
 #endif
@@ -446,7 +449,9 @@ layout(set = 0, binding = 7, std430) NR_COH readonly buffer ActU32V { uint act_u
 layout(set = 0, binding = 3, std430) readonly buffer WgtU32V { uint wgt_u32v[]; };
 #endif
 
+#define NR_TC_WBIND 3   // NR_TCHAIN reads its records from the weight buffer
 #include "nr_chain.glsl"
+#include "occ_pad.glsl"
 layout(push_constant) uniform Push {
     uint gd_off;    // diag(g) tiles, in f16 elements (NR_EPI_WMMA)
     uint x_off;     // matmul input, in elements of its own view (f16, or e4m3
@@ -469,7 +474,11 @@ layout(push_constant) uniform Push {
     // C>=64 DS: the real output extent inside the padded view (0: none). The
     // native epilogue writes zero outside it; see the store below.
     uint clear_x, clear_y;
+#if NR_GEMM_REMAP_PC
+    uint remap;       // workgroup order, 0 = launch order (see mg0 below)
+#endif
     NR_CHAIN_FIELDS
+    NR_TCHAIN_FIELDS
 } pc;
 
 // A shader lint sizes these statically against decision 12's 32 KB.
@@ -1420,6 +1429,7 @@ void nr_finish_qkv_pair(NR_FRAG_ACC a, NR_FRAG_ACC b, uint tok0, uint ch0, uint 
 void main() {
     NR_PROF_BEGIN()
     nr_chain_wait()
+    NR_TC_PROLOGUE
 #if NR_COHERENT_ACT
     // Keep every activation view both read and written; see coherent_act.glsl.
     if (NR_COH_NEVER) {
@@ -1435,9 +1445,28 @@ void main() {
     const uint lane = tid % 32u;
     const uint mloc = (wave / uint(NR_WN)) * uint(NR_MFRAG * 16);
     const uint nloc = (wave % uint(NR_WN)) * uint(NR_NFRAG * 16);
+#if NR_GEMM_REMAP_PC
+    // Workgroup order from the host (pc.remap = G): G M tiles are consecutive
+    // workgroups, then every N tile, then the next G M tiles; 0 is the launch
+    // order. Which tile a workgroup computes changes, not how. The ViT FFN
+    // contraction at 1080p ran 29 -> 25 us under G = 2 (nr_graph.cpp).
+    uint nr_gm = gl_WorkGroupID.x, nr_gn = gl_WorkGroupID.y;
+    if (pc.remap != 0u) {
+        const uint gx = gl_NumWorkGroups.x, gy = gl_NumWorkGroups.y;
+        const uint lin = gl_WorkGroupID.x + gx * gl_WorkGroupID.y;
+        const uint G = pc.remap;
+        const uint grp = lin / (G * gy), bm = grp * G, gt = min(G, gx - bm);
+        const uint r = lin - grp * G * gy;
+        nr_gm = bm + r % gt; nr_gn = r / gt;
+    }
+    const uint mg0 = nr_gm * uint(NR_MTILE);
+    const uint ng0 = nr_gn * uint(NR_NTILE);
+#else
     const uint mg0 = gl_WorkGroupID.x * uint(NR_MTILE);
     const uint ng0 = gl_WorkGroupID.y * uint(NR_NTILE);
+#endif
     const uint nchunk = pc.K / uint(NR_KCHUNK);
+    nr_tchain_wait(mg0 / 16u, NR_MTILE / 16)   // NR_TCHAIN: the M tile's token tiles
 
 #if defined(NR_A_DIRECT) || defined(NR_B_DIRECT)
     uint abase_g[NR_MFRAG];
@@ -1530,6 +1559,8 @@ void main() {
 #else
     NR_FOR_I(NR_MFRAG, NR_EPI_I)
 #endif
+    NR_OCC_USE(pc.K == 0u, act_f32[0] = 0.0)
     nr_chain_signal()
+    nr_tchain_signal_wave((mg0 + mloc) / 16u, NR_MFRAG)
     NR_PROF_END(pc.o_off)
 }

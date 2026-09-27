@@ -1,5 +1,6 @@
 #include "nr_pe_session.hpp"
 #include "nr_pe_log.hpp"
+#include "nr_pe_vkdevice.hpp"
 #include "nr_log.hpp"
 #include <windows.h>
 #include <algorithm>
@@ -248,6 +249,8 @@ struct Session::Impl {
     uint32_t max_passes_want{kMaxPasses};
     bool ensure_own_command_buffer();
     bool ensure_d3d12_device(ID3D12Device* device);
+    // The Vulkan device underneath is vkd3d-proton's, which always enables bufferDeviceAddress.
+    bool vkd3d_device = false;
     bool fits_in_memory(uint32_t w, uint32_t h);
     // Session::Impl::memory_guard. False while the network is held off.
     bool memory_guard();
@@ -689,9 +692,10 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
     HostDevice host{};
     host.instance = handles.instance; host.physical = handles.physical; host.device = handles.device;
     // A real queue and its real family. Construction submits the weight upload
-    // and waits for it, so the queue is held for the duration: the game is
-    // submitting to the same underlying VkQueue.
+    // and waits for it; the game is submitting to the same underlying VkQueue,
+    // so each of those submits takes the queue lock (below).
     host.queue = access.queue; host.queue_family = access.family;
+    host.buffer_device_address = vkd3d_device || vkdevice::network_features_added(handles.device);
     // Off the render thread. Building reads the weights, creates every pipeline
     // and allocates the arena, and doing that inside the upscaler's call froze
     // the game for the duration every time the feature was first turned on. The
@@ -702,7 +706,10 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
     building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
     build_scale = model_scale; build_passes = max_passes_want;
     status = "building the network in the background; frames pass through until it is ready";
-    log("[nr] building the network at %ux%u (model scale %.2f) in the background%s", w, h, model_scale,
+    VkPhysicalDeviceProperties gpu{};
+    vkGetPhysicalDeviceProperties(handles.physical, &gpu);
+    log("[nr] building the network at %ux%u (model scale %.2f) on %s in the background%s", w, h, model_scale,
+        gpu.deviceName,
         want_linear ? " (linear-light colour: encoding with a white point, see dlssnr-amd.ini white_point)" : "");
     build_thread = std::thread([this, host, config, temporal, access_copy] {
         const auto t0 = std::chrono::steady_clock::now();
@@ -710,11 +717,17 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
         std::string error;
         bool oom = false;
         try {
-            // **Quiet**: this is not the render thread, and the flush half of
-            // the other lock drives DXVK's immediate context, which that thread
-            // owns. See QueueAccess::lock_quiet.
-            QueueAccess::HeldQuiet held(access_copy);
-            made = std::make_unique<Runtime>(host, config, ControlMaskConfig{}, temporal);
+            // The queue lock around each submit of the build, not around the
+            // build: held for the whole of it, the pipeline compile (14-24 s
+            // cold at 4K under AMD's Windows compiler) blocked vkd3d's own
+            // submissions and presents on the shared queue, and the game froze
+            // for as long. **Quiet**: this is not the render thread, and the
+            // flush half of the other lock drives DXVK's immediate context,
+            // which that thread owns. See QueueAccess::lock_quiet.
+            HostDevice locked = host;
+            locked.queue_lock = access_copy.lock_quiet;
+            locked.queue_unlock = access_copy.unlock_quiet;
+            made = std::make_unique<Runtime>(locked, config, ControlMaskConfig{}, temporal);
         } catch (const std::bad_alloc&) {
             // Caught apart from everything else because it is the one failure
             // that is about the *host* and is worth retrying. `what()` here is
@@ -875,6 +888,7 @@ bool fill(ColourFrame* out, const ResourceHandle& handle) {
     out->format = handle.format;
     out->width = handle.width; out->height = handle.height;
     out->before = out->after = handle.layout;
+    out->usage = handle.usage;
     return true;
 }
 
@@ -905,6 +919,9 @@ void apply_guide_subrect(ColourFrame* guide, const Session::Subrect& want, const
         }
         return;
     }
+    // A narrowed guide is no longer the whole image: the runtime must read it
+    // through its blit, not sample the allocation in place.
+    if ((want.width && want.width < guide->width) || (want.height && want.height < guide->height)) guide->usage = 0;
     if (want.width && want.width <= guide->width) guide->width = want.width;
     if (want.height && want.height <= guide->height) guide->height = want.height;
 }
@@ -915,6 +932,7 @@ bool Session::Impl::ensure_d3d12_device(ID3D12Device* device) {
     if (handles.valid() && access.valid()) return true;
     if (!handles.valid()) {
         handles = device_handles(device);
+        vkd3d_device = handles.valid();
         if (!handles.valid()) {
             status = "no Vulkan device underneath; not running on vkd3d-proton";
             failed = true;
@@ -1156,6 +1174,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     frame.format = target.format;
     frame.width = target.width; frame.height = target.height;
     frame.before = frame.after = target.layout;
+    frame.usage = target.usage;
 
     EngineFrame engine{};
     engine.colour = frame;

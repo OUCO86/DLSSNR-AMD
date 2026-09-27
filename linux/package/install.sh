@@ -3,8 +3,11 @@
 #
 #   bash install.sh <folder with the game's exe> [route] [--dll <nvngx_dlssnr.dll or .zip>]
 #
+# Unreal Engine games: the folder is <project>/Binaries/Win64 (the *-Shipping.exe), not the top
+# folder with the launcher exe.
+#
 # Routes:
-#   optiscaler  the game has a DLSS option: OptiScaler, with this project as its DLSS-NR backend (64-bit only)
+#   optiscaler  the game has a DLSS, FSR or XeSS option: OptiScaler, with this project as its DLSS-NR backend (64-bit only)
 #   reshade     D3D10/11/12 games without a usable upscaler: ReShade + VORT motion vectors
 #   vulkan      Vulkan games, or D3D9 games (DXVK turns D3D9 into Vulkan under Proton)
 #   dx9         as vulkan, plus the depth direction for old D3D9 games
@@ -28,15 +31,18 @@ game="" route="" dll=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dll) dll=${2:?--dll needs a file path}; shift 2;;
-        -h|--help) sed -n '2,18p' "$0"; exit 0;;
+        -h|--help) sed -n '2,21p' "$0"; exit 0;;
         *) if [[ -z "$game" ]]; then game=$1; elif [[ -z "$route" ]]; then route=$1;
            else echo "unexpected argument: $1" >&2; exit 1; fi; shift;;
     esac
 done
-[[ -n "$game" ]] || { sed -n '2,18p' "$0"; exit 1; }
+[[ -n "$game" ]] || { sed -n '2,21p' "$0"; exit 1; }
 [[ -d "$game" ]] || { echo "no such folder: $game" >&2; exit 1; }
 game=$(cd -- "$game" && pwd)
 manifest="$game/dlssnr-amd-install.txt"
+if compgen -G "$game/*/Binaries/Win64/*.exe" > /dev/null; then
+    echo "Note: this looks like the top folder of an Unreal Engine game; install into <project>/Binaries/Win64 (the *-Shipping.exe) instead." >&2
+fi
 bits=64; [[ -f "$here/reshade/dlssnr_amd.addon32" ]] && bits=32
 
 exe_bits=$(python3 - "$game" <<'PY' 2>/dev/null || true
@@ -56,7 +62,7 @@ PY
 if [[ -z "$route" ]]; then
     echo
     echo "This is the $bits-bit package; the game folder's exe is ${exe_bits:-unknown}-bit. Choose a route:"
-    echo "  1) optiscaler  the game has a DLSS option (OptiScaler, 64-bit only)"
+    echo "  1) optiscaler  the game has a DLSS, FSR or XeSS option (OptiScaler, 64-bit only)"
     echo "  2) reshade     D3D10/11/12 game without a usable upscaler"
     echo "  3) vulkan      Vulkan game, or D3D9 game"
     echo "  4) dx9         as 3, plus the depth setting for old D3D9 games"
@@ -166,7 +172,7 @@ echo
 echo "Installed the $route route into: $game"
 echo "Steam launch options:  WINEDLLOVERRIDES=\"$overrides\" %command%"
 if [[ "$route" == optiscaler ]]; then
-    echo "In the game, turn on DLSS in its settings; Insert opens the OptiScaler menu, DLSS Neural Rendering has its own page."
+    echo "In the game, turn on DLSS, FSR or XeSS in its settings; Insert opens the OptiScaler menu, DLSS Neural Rendering has its own page."
     echo "If the NR page keeps showing 'Waiting for the upscaler to run', set [Spoofing] Dxgi=false in OptiScaler.ini and try again."
 else
     echo "In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini directly."

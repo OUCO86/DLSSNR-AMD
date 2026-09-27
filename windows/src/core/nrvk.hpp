@@ -15,8 +15,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -38,6 +40,7 @@ struct Buffer {
     VkDeviceMemory memory{};
     void* mapped{};
     VkDeviceSize bytes{};
+    VkDeviceAddress address{};   // buffer(.., device_address = true) only
     template <class T> T* as() { return static_cast<T*>(mapped); }
 };
 
@@ -49,8 +52,23 @@ struct Context {
     uint32_t family{};
     VkPhysicalDeviceMemoryProperties mem{};
     float timestamp_period{};
+    // bufferDeviceAddress is enabled on the device: kernels may read the activation arena through
+    // a buffer_reference (vit_attn.comp NR_VBDA - LLPC's transposing global load). Set by create();
+    // an adopted device says so through HostDevice::buffer_device_address.
+    bool buffer_device_address = false;
     std::string gpu_name, driver_name;
     bool device_local_host_visible = false;
+    // A queue borrowed from a host API (vkd3d-proton, DXVK) is externally
+    // synchronised by that API's own lock. When set, the lock is taken around
+    // each submit and nothing else, so a build that spends seconds compiling
+    // pipelines does not hold the game's queue for those seconds.
+    std::function<void()> queue_lock, queue_unlock;
+    void submit(const VkSubmitInfo& si, VkFence fence) {
+        if (queue_lock) queue_lock();
+        const VkResult r = vkQueueSubmit(queue, 1, &si, fence);
+        if (queue_unlock) queue_unlock();
+        NRVK_CHECK(r);
+    }
 #ifdef NR_PIPELINE_STATS
     // Evaluation builds only: compile time and the driver's
     // own register/LDS statistics for every pipeline, printed as it is built.
@@ -121,6 +139,17 @@ struct Context {
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         f12.storageBuffer8BitAccess = VK_TRUE; f12.shaderFloat16 = VK_TRUE;
         f12.shaderInt8 = VK_TRUE; f12.vulkanMemoryModel = VK_TRUE;
+        {
+            VkPhysicalDeviceVulkan12Features q12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            q.pNext = &q12;
+            vkGetPhysicalDeviceFeatures2(physical, &q);
+            // NR_NO_BDA=1: as if the device had none (checks the g_*nobda.spv fallback).
+            const char* no_bda = std::getenv("NR_NO_BDA");
+            const bool bda = q12.bufferDeviceAddress && !(no_bda && *no_bda == '1');
+            f12.bufferDeviceAddress = bda;
+            buffer_device_address = bda;
+        }
         f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         f13.subgroupSizeControl = VK_TRUE;
         // Core in 1.3 and still an opt-in feature: without it
@@ -398,12 +427,14 @@ struct Context {
     // It is also what the shipping runtime does: the OptiScaler adapter
     // allocates decision 6's two arenas out of device-local memory and the game
     // never maps them.
-    Buffer buffer(VkDeviceSize bytes, bool host_visible = false) {
+    Buffer buffer(VkDeviceSize bytes, bool host_visible = false, bool device_address = false) {
         Buffer b; b.bytes = bytes;
+        device_address = device_address && buffer_device_address;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (device_address) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         NRVK_CHECK(vkCreateBuffer(device, &info, nullptr, &b.handle));
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, b.handle, &req);
@@ -426,8 +457,16 @@ struct Context {
                                                   : "no device-local, non-host-visible memory type");
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        if (device_address) alloc.pNext = &flags;
         NRVK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &b.memory));
         NRVK_CHECK(vkBindBufferMemory(device, b.handle, b.memory, 0));
+        if (device_address) {
+            VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            ai.buffer = b.handle;
+            b.address = vkGetBufferDeviceAddress(device, &ai);
+        }
         if (host_visible) {
             NRVK_CHECK(vkMapMemory(device, b.memory, 0, bytes, 0, &b.mapped));
             std::memset(b.mapped, 0, bytes);
@@ -464,7 +503,7 @@ struct Context {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence;
         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        NRVK_CHECK(vkQueueSubmit(queue, 1, &si, fence));
+        submit(si, fence);
         NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
         if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
         vkDestroyFence(device, fence, nullptr);
@@ -506,7 +545,8 @@ struct Context {
     // that. A caller that is *recording a command buffer* must not block the
     // thread it is on, and can do the same transition in that buffer for free:
     // it passes false and owns the layout from then on.
-    Image image(uint32_t w, uint32_t h, VkFormat format, bool sampled, bool settle = true) {
+    Image image(uint32_t w, uint32_t h, VkFormat format, bool sampled, bool settle = true,
+                bool storage = true) {
         Image im; im.w = w; im.h = h; im.format = format;
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_2D;
@@ -522,6 +562,9 @@ struct Context {
         ii.usage = (sampled ? VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
                             : VK_IMAGE_USAGE_STORAGE_BIT)
                  | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        // A sampled-only image (the runtime's input in the caller's own format,
+        // which need not be storage-capable - *_SRGB's UNORM twin, 11/11/10).
+        if (!storage) ii.usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT);
         ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         NRVK_CHECK(vkCreateImage(device, &ii, nullptr, &im.handle));
@@ -586,7 +629,7 @@ struct Context {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence;
         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        NRVK_CHECK(vkQueueSubmit(queue, 1, &si, fence));
+        submit(si, fence);
         NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
         vkDestroyFence(device, fence, nullptr);
         vkDestroyCommandPool(device, pool, nullptr);
@@ -960,7 +1003,7 @@ struct Runner {
         NRVK_CHECK(vkResetFences(ctx->device, 1, &fence));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        NRVK_CHECK(vkQueueSubmit(ctx->queue, 1, &si, fence));
+        ctx->submit(si, fence);
         NRVK_CHECK(vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, 30000000000ull));
         uint64_t ts[2] = {0, 0};
         NRVK_CHECK(vkGetQueryPoolResults(ctx->device, queries, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
@@ -1149,7 +1192,7 @@ struct Runner {
         NRVK_CHECK(vkResetFences(ctx->device, 1, &fence));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-        NRVK_CHECK(vkQueueSubmit(ctx->queue, 1, &si, fence));
+        ctx->submit(si, fence);
         NRVK_CHECK(vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, 30000000000ull));
         uint64_t ts[2] = {0, 0};
         NRVK_CHECK(vkGetQueryPoolResults(ctx->device, queries, 0, 2, sizeof(ts), ts,

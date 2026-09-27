@@ -9,7 +9,8 @@ graphics cards.
 - The output is close to NVIDIA's, but not identical.
 - **Tested only on an RX 9070 XT.** Other cards are not guaranteed to work.
 - **The Windows version is still in development and has serious problems.** It is clearly slower than
-  Linux, several games crash or do not work, and it is not ready for normal use.
+  Linux, several games crash or do not work, and it is not ready for normal use. The current Windows
+  code has not been tested in games at all; you have to test and, if needed, fix it yourself.
 
 This is an independent project. It is not affiliated with, endorsed by or supported by NVIDIA or
 AMD. DLSS is a trademark of NVIDIA Corporation.
@@ -46,13 +47,13 @@ instructions the network needs.
 
 ## Performance
 
-GPU time of the network per frame on an RX 9070 XT, offline benchmark (network only; Linux: mean of
-three runs):
+GPU time of the network per frame on an RX 9070 XT, **offline benchmark** (network only), measured
+with v0.0.2.2:
 
 | | 1080p | 1440p | 4K |
 | --- | --- | --- | --- |
-| Linux | 5.92 ms | 10.26 ms | 22.56 ms |
-| Windows | 9.4 ms | - | 33 ms |
+| Linux | 5.60 ms | 9.89 ms | 22.32 ms |
+| Windows | 7.79 ms | - | 28.9 ms |
 
 In game (Linux, RX 9070 XT):
 
@@ -160,7 +161,13 @@ package needs this; its installer does not extract the model).
 ## Windows
 
 **The Windows version is still in development and has serious problems. It is not ready for normal
-use.** Known issues:
+use.**
+
+The latest update makes the Windows network faster in the **offline benchmark** (1080p 9.4 -> 7.79 ms,
+4K 33 -> 28.9 ms), but this version has not been tested in any game. There is no guarantee that it
+runs correctly in games; expect to test it yourself and possibly change the code to get it working.
+
+Known issues:
 
 - It is clearly slower than the Linux version (see Performance).
 - Every game has to run on DXVK / vkd3d-proton, which changes the game's own performance and
@@ -168,6 +175,9 @@ use.** Known issues:
 - Several games crash or do not work: DX11 games cannot use the OptiScaler route, overlays (Steam and
   others) conflict, Final Fantasy XIV crashes together with Dalamud, and the network pauses itself
   when video or system memory runs short.
+- The picture is not the same as the Linux version's. The Windows network is built for the AMD
+  Windows driver's shader compiler and rounds differently in places; on a 1080p test frame the two
+  outputs are 48.6 dB PSNR apart.
 
 There are no ready-made Windows packages; build one yourself (next section). Read
 [windows/package/README.txt](windows/package/README.txt) for its known limits before trying it.

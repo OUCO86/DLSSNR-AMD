@@ -53,4 +53,8 @@ void set_device_callback(void (*callback)(VkDevice));
 // Vulkan init does. Recording it here keeps one source of truth.
 void note_handles(VkInstance instance, VkPhysicalDevice physical, VkDevice device);
 
+// The watch added the network's features (nr::DeviceFeatures::enable, bufferDeviceAddress among
+// them) to this device's vkCreateDevice and the device was created with them.
+bool network_features_added(VkDevice device);
+
 }  // namespace nr::pe::vkdevice
