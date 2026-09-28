@@ -23,6 +23,7 @@
 #include <d3d12.h>
 
 #include "nr_dlssnr_model.hpp"
+#include "nr_pe_config.hpp"
 #include "nr_pe_interop.hpp"
 #include "nr_pe_log.hpp"
 #include "nr_pe_session.hpp"
@@ -103,6 +104,23 @@ nr::pe::Session& vk_session() {
         g_vk_session->set_native_compose(true);
     }
     return *g_vk_session;
+}
+
+// [Preprocess] in dlssnr-amd.ini beside this module: the file re-read at most once a second, the
+// hotkey every evaluate. Written with the defaults (off) when absent. OptiScaler knows nothing of it:
+// the change is made on the proxy it hands us and taken back out of the answer before it gets it back.
+nr::Preprocess preprocess_now() {
+    static nr::pe::PreprocessFile file;
+    static nr::pe::PreprocessConfig config;
+    static nr::pe::PreprocessSwitch toggle;
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now >= next) {
+        next = now + 1000;
+        const char* folder = nr::pe::module_folder();
+        if (*folder) file.poll(std::string(folder) + "\\dlssnr-amd.ini", config);
+    }
+    return toggle.frame(config);
 }
 
 // Multi-pass, and why nothing here has to be given up for it.
@@ -978,6 +996,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     }
 
     f->controls = controls_from(controls);
+    f->controls.preprocess = preprocess_now();
 
     nr::pe::Session::EngineResources resources{};
     resources.feature = f->id;
@@ -1233,6 +1252,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     frame.motion_scale_y = normalized_mv_scale(mv_scale_y, frame.height);
 
     f->controls = controls_from(controls);
+    f->controls.preprocess = preprocess_now();
     write_evaluate_keys(params, controls, frame.reset, depth_inverted);
 
     auto& session = vk_session();

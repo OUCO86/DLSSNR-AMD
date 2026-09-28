@@ -41,6 +41,14 @@ OptiScaler: turn on DLSS (or FSR / XeSS) in the game's graphics settings. Insert
 ReShade:    Home opens ReShade, the settings are on the Add-ons page; the same settings are
             kept in dlssnr-amd.ini in the game folder and changes apply live.
 
+Preprocess (optional, off by default): [Preprocess] in dlssnr-amd.ini in the game folder (the
+OptiScaler route writes the file on first start; ReShade also shows it on the Add-ons page).
+It changes the picture the network is shown (exposure, display curve, contrast, saturation),
+and so how NR edits the picture. Two uses: a personal look in any game (it departs from the
+original look; the result may be better or worse), and games that do not hand their exposure
+to the upscaler, which it fixes (007 First Light turns green and grainy with NR otherwise).
+Ctrl+F10 switches it for the current run, to compare. The file explains every setting.
+
 The first time in game the network has to compile and takes about half a minute to start;
 after that it is cached.
 

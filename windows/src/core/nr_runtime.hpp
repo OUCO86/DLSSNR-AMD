@@ -1,4 +1,5 @@
 #pragma once
+#include <utility>
 #include <vector>
 #include <vulkan/vulkan.h>
 #include <cstdint>
@@ -20,6 +21,35 @@ struct PassControls {
     float local_structure = 1.0f;
     float skin_structure = -1.0f;
     bool automatic_mask = true;
+};
+
+// [Preprocess] in dlssnr-amd.ini: what the network is shown is changed before
+// it runs and every change is taken back out of its answer
+// (linux/shaders/passes/runtime_prep.comp). Opt-in; the defaults below are what
+// Enabled=1 starts from (auto exposure, filmic curve), and each field has
+// a value that leaves the frame as the host handed it over (exposure off,
+// curve 0, contrast and saturation 1).
+// Needs a runtime built with RuntimeConfig::preprocess.
+struct Preprocess {
+    bool enabled = false;
+    // 0 off; 1 auto: a game engine's histogram auto exposure
+    // (runtime_prep.comp meter()), plus bias_ev; 2 fixed: bias_ev alone
+    int exposure = 1;
+    float bias_ev = 0.0f;        // -8..8
+    // 0 none, 1 neutral, 2 reinhard, 3 filmic, 4 gt, 5 aces, 6 agx
+    int curve = 3;
+    float contrast = 1.0f;       // about mid grey, 0.5..2
+    float saturation = 1.0f;     // 0.05..2
+    // Does any of it change anything? False records nothing.
+    bool active() const {
+        return enabled && (exposure == 1 || (exposure == 2 && bias_ev != 0.0f) || curve != 0 ||
+                           contrast != 1.0f || saturation != 1.0f);
+    }
+    bool operator==(const Preprocess& o) const {
+        return enabled == o.enabled && exposure == o.exposure && bias_ev == o.bias_ev && curve == o.curve &&
+               contrast == o.contrast && saturation == o.saturation;
+    }
+    bool operator!=(const Preprocess& o) const { return !(*this == o); }
 };
 
 // In-process interface shared by game adapters and the native menu.
@@ -49,6 +79,7 @@ struct Controls {
     // `used == false`, or a pass past the end of this, inherits pass 1 with the
     // tone zeroed. Empty is exactly the behaviour that shipped before.
     std::vector<PassControls> per_pass{};
+    Preprocess preprocess{};
 };
 
 struct HostDevice {
@@ -113,6 +144,15 @@ struct RuntimeConfig {
     // pass, so `colour` and `model_scale` have no effect. What a host that does
     // its own resolve afterwards (OptiScaler) must be given.
     bool native_compose = false;
+    // Able to run Controls::preprocess. Costs the frame-format input copy and
+    // the post block's direct store (the input has to be a float image the
+    // preprocess can rewrite), whether or not a frame asks for it; off, the
+    // runtime is exactly what it was.
+    bool preprocess = false;
+    // The frame is a proxy of linear light made with OptiScaler's soft knee
+    // (its linear-HDR encode, or linear_input's own): the preprocess undoes the
+    // knee first, so its curve is the only one. False for an SDR frame.
+    bool preprocess_unknee = false;
 };
 
 // SDR encoded RGB, source-sized and upright. Accepts RGBA32F and 8-bit RGBA/BGRA
@@ -332,6 +372,9 @@ public:
     // The same, smoothed over recent frames - what to put in a UI, because the
     // instantaneous number moves too much to read.
     float average_gpu_ms() const;
+    // The preprocess meter as the GPU last left it: {smoothed EV, this frame's
+    // target EV}, bias not included. For the log; NaN until it has metered.
+    std::pair<float, float> preprocess_meter() const;
 
 private:
     struct Impl;

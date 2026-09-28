@@ -146,7 +146,7 @@ case "$route" in
         rm -rf -- "$tmp"
         for f in nvngx.dll_dlssnr.dll nvngx_dlssnr.dll dlssnr_core.dll; do put_file "$here/optiscaler/$f" "$f"; done
         python3 "$here/optiscaler/patch_ini.py" "$game"
-        record OptiScaler.log; record dlssnr-amd.log
+        record OptiScaler.log; record dlssnr-amd.log; record dlssnr-amd.ini
         overrides="dxgi=n,b"
         ;;
     reshade)
@@ -174,6 +174,7 @@ echo "Steam launch options:  WINEDLLOVERRIDES=\"$overrides\" %command%"
 if [[ "$route" == optiscaler ]]; then
     echo "In the game, turn on DLSS, FSR or XeSS in its settings; Insert opens the OptiScaler menu, DLSS Neural Rendering has its own page."
     echo "If the NR page keeps showing 'Waiting for the upscaler to run', set [Spoofing] Dxgi=false in OptiScaler.ini and try again."
+    echo "If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game."
 else
     echo "In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini directly."
 fi

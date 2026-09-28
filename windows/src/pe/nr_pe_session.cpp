@@ -143,6 +143,7 @@ struct Session::Impl {
         // The pass ceiling this one was built for: it sizes one history image
         // per pass, so a network built for four cannot serve a request for six.
         uint32_t passes{4};
+        bool prep{};   // RuntimeConfig::preprocess
         uint64_t used{};   // LRU stamp
     };
     std::vector<Built> cache;
@@ -206,7 +207,13 @@ struct Session::Impl {
     // in a float format), so the runtime encodes it; false for every swapchain.
     // Builds in the background: returns false, with `status` saying so, until
     // the network is ready, and the caller leaves the frame alone meanwhile.
-    bool ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool linear);
+    // `controls` asking for a preprocess makes every runtime from then on one
+    // that can run it (prep_want); see RuntimeConfig::preprocess.
+    bool ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format, bool linear);
+    bool ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format, bool linear);
+    // The preprocess meter in the log every five seconds while it runs, so NR on/off at one spot
+    // can be compared (the feedback loop that made upstream drop frame metering).
+    std::chrono::steady_clock::time_point meter_logged{};
     static bool is_linear_format(VkFormat f) {
         return f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
                f == VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -216,7 +223,7 @@ struct Session::Impl {
     // thread adopts whichever on its next call.
     std::thread build_thread;
     std::mutex build_lock;
-    bool building{}, build_done{}, build_linear{};
+    bool building{}, build_done{}, build_linear{}, build_prep{};
     uint32_t build_passes{kMaxPasses};
     uint32_t build_w{}, build_h{};
     VkFormat build_format{VK_FORMAT_UNDEFINED};
@@ -239,6 +246,10 @@ struct Session::Impl {
     // Model Resolution. A change rebuilds the network, like a resolution change.
     float model_scale{1.0f}, build_scale{1.0f}, built_scale{1.0f};
     bool native_compose{};   // Session::set_native_compose
+    // Controls::preprocess was asked for once: from then on every runtime is
+    // built able to run it, so the hotkey switches at once after the first
+    // time. Never cleared; until then nothing about the runtime changes.
+    bool prep_want{};
     // Every runtime is built able to run this many passes; Controls::passes
     // picks the count per frame.
     // What a network is built for unless the host asks for more. Four is what
@@ -272,7 +283,7 @@ struct Session::Impl {
     // Free least-recently-used entries until the card can hold another network
     // at this extent. False means it cannot hold one even with the cache empty.
     bool make_room(uint32_t w, uint32_t h);
-    void drop(size_t index);
+    void drop(size_t index, const char* why = "to make room");
     // Feature ids, handed out by Session::create_feature. Monotonic, never
     // reused, so a stale id can only ever miss.
     uint64_t next_feature{1};
@@ -564,7 +575,7 @@ bool Session::Impl::memory_guard() {
 bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear) {
     for (auto& e : cache) {
         if (e.width != w || e.height != h || e.format != format || e.linear != want_linear ||
-            e.scale != model_scale || e.passes != max_passes_want)
+            e.scale != model_scale || e.passes != max_passes_want || e.prep != prep_want)
             continue;
         e.used = ++use_stamp;
         if (runtime != e.runtime.get()) {
@@ -581,9 +592,9 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format, bool
     return false;
 }
 
-void Session::Impl::drop(size_t index) {
+void Session::Impl::drop(size_t index, const char* why) {
     auto& e = cache[index];
-    log("[nr] evicting the %ux%u network to make room", e.width, e.height);
+    log("[nr] evicting the %ux%u network %s", e.width, e.height, why);
     if (runtime == e.runtime.get()) { runtime = nullptr; width = height = 0; }
     // Nothing of ours may still be reading it. On the paths that submit for
     // themselves this waits on our own fence; on the paths that record into the
@@ -605,7 +616,28 @@ bool Session::Impl::make_room(uint32_t w, uint32_t h) {
     }
 }
 
-bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool want_linear) {
+bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
+                                   bool want_linear) {
+    const bool ok = ensure_runtime_(controls, w, h, format, want_linear);
+    if (ok && controls.preprocess.active() && controls.preprocess.exposure == 1) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto m = runtime->preprocess_meter();
+        if (now - meter_logged > std::chrono::seconds(5) && m.first == m.first) {
+            meter_logged = now;
+            const float bias = controls.preprocess.bias_ev;
+            log("[nr] preprocess exposure: auto %+.2f EV (this frame asks %+.2f) + ExposureBias %+.2f = %+.2f EV",
+                m.first, m.second, bias, m.first + bias);
+        }
+    }
+    return ok;
+}
+
+bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32_t h, VkFormat format,
+                                    bool want_linear) {
+    if (controls.preprocess.active() && !prep_want) {
+        prep_want = true;
+        log("[nr] preprocess asked for: networks are rebuilt able to run it (once)");
+    }
     // Adopt a finished background build first.
     {
         std::lock_guard<std::mutex> guard(build_lock);
@@ -616,7 +648,7 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
                 Built entry;
                 entry.width = build_w; entry.height = build_h; entry.format = build_format;
                 entry.linear = build_linear; entry.scale = build_scale;
-                entry.passes = build_passes;
+                entry.passes = build_passes; entry.prep = build_prep;
                 entry.used = ++use_stamp;
                 entry.runtime = std::move(built);
                 log("[nr] network built at %ux%u (model %ux%u, scale %.2f) on queue family %u in "
@@ -625,6 +657,13 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
                     entry.runtime->model_height(), entry.scale, access.family, build_seconds,
                     entry.linear ? "; the colour is linear light and is encoded for the network" : "",
                     unsigned(cache.size() + 1));
+                // A network built without the preprocess at this extent is
+                // never selected again; its memory goes now. Its last frame
+                // was before this build started, a second or more ago.
+                for (size_t i = cache.size(); i-- > 0;)
+                    if (entry.prep && !cache[i].prep && cache[i].width == entry.width &&
+                        cache[i].height == entry.height)
+                        drop(i, "built without the preprocess");
                 cache.push_back(std::move(entry));
                 auto& adopted = cache.back();
                 runtime = adopted.runtime.get();
@@ -686,6 +725,12 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
     config.model_scale = model_scale;
     config.max_passes = native_compose ? 1u : max_passes_want;
     config.native_compose = native_compose;
+    config.preprocess = prep_want;
+    // The soft knee to undo: the linear path's own encode, or OptiScaler's
+    // linear-HDR encode, which a float proxy on the OptiScaler route came
+    // through (OptiScaler encodes a float colour flagged IsHDR or AutoExposure
+    // and hands an SDR one over as it is, and only the format reaches us).
+    config.preprocess_unknee = want_linear || (native_compose && is_linear_format(format));
     if (native_compose) config.model_scale = 1.0f;   // the DLL has no resample; OptiScaler scales outside
     TemporalConfig temporal; temporal.enable = true;
     temporal.history_strength = history_strength;
@@ -704,7 +749,7 @@ bool Session::Impl::ensure_runtime(uint32_t w, uint32_t h, VkFormat format, bool
     // the build is adopted above.
     const QueueAccess access_copy = access;
     building = true; build_w = w; build_h = h; build_format = format; build_linear = want_linear;
-    build_scale = model_scale; build_passes = max_passes_want;
+    build_scale = model_scale; build_passes = max_passes_want; build_prep = prep_want;
     status = "building the network in the background; frames pass through until it is ready";
     VkPhysicalDeviceProperties gpu{};
     vkGetPhysicalDeviceProperties(handles.physical, &gpu);
@@ -1081,7 +1126,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     // The network's extent is the *render* resolution, which changes with the
     // upscaler's quality preset. Rebuild rather than scale: this pass is only
     // cheap because it runs at exactly the size the game rendered.
-    if (!s.ensure_runtime(colour_vk.width, colour_vk.height, colour_vk.format,
+    if (!s.ensure_runtime(controls, colour_vk.width, colour_vk.height, colour_vk.format,
                           !resources.colour_encoded &&
                               Session::Impl::is_linear_format(colour_vk.format)))
         return nullptr;
@@ -1163,7 +1208,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
     const auto target = resource_handle(device, output, output_state);
     if (!target.usable()) { s.status = describe_rejection(target, "output"); return false; }
-    if (!s.ensure_runtime(target.width, target.height, target.format,
+    if (!s.ensure_runtime(controls, target.width, target.height, target.format,
                           !resources.colour_encoded &&
                               Session::Impl::is_linear_format(target.format))) return false;
 
@@ -1248,7 +1293,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
     const auto target = resource_handle(device, back_buffer, D3D12_RESOURCE_STATE_PRESENT);
     if (!target.usable()) { s.status = describe_rejection(target, "back buffer"); return false; }
-    if (!s.ensure_runtime(target.width, target.height, target.format, false)) return false;
+    if (!s.ensure_runtime(controls, target.width, target.height, target.format, false)) return false;
 
     // Here the network works on the game's own buffer: there is nothing to hand
     // anyone afterwards, the frame just has to come out enhanced.
@@ -1322,7 +1367,7 @@ bool Session::run_d3d11(const D3D11Frame& frame, const Controls& controls) {
         s.status = "the game's texture cannot be copied to and from; nothing to run on";
         return false;
     }
-    if (!s.ensure_runtime(target.width, target.height, target.format,
+    if (!s.ensure_runtime(controls, target.width, target.height, target.format,
                           (frame.upscaler_input || frame.linear_hdr) && !frame.estimate_motion &&
                           Session::Impl::is_linear_format(target.format))) return false;
     if (!s.ensure_own_command_buffer()) return false;
@@ -1439,7 +1484,7 @@ bool Session::run_present_vulkan(const DeviceHandles& handles, VkQueue queue, ui
     for (auto& other : s.slots) if (!s.wait_slot(other)) return false;
     // Only after the slot is free: rebuilding the runtime destroys images this
     // slot's command buffer may still be reading.
-    if (!s.ensure_runtime(width, height, format, false)) return false;
+    if (!s.ensure_runtime(controls, width, height, format, false)) return false;
 
     // A swapchain image at present time is in PRESENT_SRC. The pass transfers in
     // and out of it, and leaves it exactly as it found it: the present that
@@ -1519,7 +1564,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         if (!s.ensure_vk_output(frame.width, frame.height, frame.colour_format))
             return VK_NULL_HANDLE;
     }
-    if (!s.ensure_runtime(frame.width, frame.height, frame.colour_format,
+    if (!s.ensure_runtime(controls, frame.width, frame.height, frame.colour_format,
                           (frame.upscaler_input || frame.linear_hdr) &&
                               Session::Impl::is_linear_format(frame.colour_format)))
         return VK_NULL_HANDLE;

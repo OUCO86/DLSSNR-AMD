@@ -3,6 +3,7 @@
 #include "nr_runtime_dispatch.hpp"
 #define NR_NO_MAIN 1
 #include "nr_graph.cpp"
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <mutex>
@@ -69,6 +70,18 @@ void compute_barrier(VkCommandBuffer cmd, bool exec_only = false, bool inv_only 
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, exec_only ? 0u : 1u, &b,
                          0, nullptr, 0, nullptr);
 }
+
+// runtime_prep.comp's push block; see the shader.
+struct PrepPush {
+    uint32_t w, h, mode, flags, curve;
+    float bias, contrast, saturation, k, cap;
+    float dt;   // seconds since the last metered frame (the meter adapts in real time)
+};
+enum : uint32_t { kPrepAuto = 1, kPrepUnknee = 2, kPrepRestore = 4, kPrepReset = 8 };
+// Each curve's input scale that leaves mid grey (0.18) where it was, so the
+// curves shape shadows and highlights and the exposure alone sets brightness.
+// Solved numerically, once, for each curve below.
+constexpr float kPrepAnchor[7] = {1.0f, 1.0f, 1.2195122f, 2.9275228f, 1.0052344f, 0.7231708f, 0.8083602f};
 
 void dispatch(VkCommandBuffer cmd, const nrvk::Kernel& k, uint32_t x, uint32_t y,
               uint32_t z, const void* push, uint32_t bytes, VkDescriptorSet set = VK_NULL_HANDLE) {
@@ -254,6 +267,24 @@ struct Runtime::Impl {
     nrvk::Kernel encode, transfer_pass;
     nrvk::Context::Image keep{};
     bool linear{};
+    // Preprocess (RuntimeConfig::preprocess): runtime_prep.comp's meter,
+    // forward and back modes, the frame as it came in (`prep_keep`, model
+    // sized) and the meter's state. `prep_back` is `prep` itself unless later
+    // passes overwrite tex_in, when the first pass's input is shown_keep and
+    // the frame is put back there for the transfer pass. `transfer_prep` is the
+    // transfer pass reading prep_keep as what the network was shown.
+    bool prep{}, prep_unknee{};
+    nrvk::Kernel prep_k, prep_back_k, transfer_prep;
+    nrvk::Context::Image prep_keep{};
+    nrvk::Buffer prep_state{};
+    // What the last frame asked for. A change resets the meter and bumps
+    // prep_gen; each history made under another generation (in the other
+    // domain) is not consumed, per feature, as OptiScaler runs each pass as
+    // its own feature.
+    bool prep_was_on{};
+    Preprocess prep_last{};
+    std::chrono::steady_clock::time_point prep_metered{};
+    uint32_t prep_gen{}, prep_gen_single{};
     float white_point{1.0f};
     // Model Resolution: the network runs at mw x mh, the frame is width x
     // height. When they differ, `keep_full` holds the frame as handed over
@@ -332,6 +363,7 @@ struct Runtime::Impl {
         bool latch{};
         uint32_t parity{};
         bool cleared{};
+        uint32_t prep_gen{};   // Impl::prep_gen its history was made under
     };
     std::map<uint64_t, FeatureState> features;
     uint64_t bound_feature{};
@@ -716,6 +748,11 @@ struct Runtime::Impl {
         if (alpha.device) alpha.destroy();
         if (encode.device) encode.destroy();
         if (transfer_pass.device) transfer_pass.destroy();
+        if (prep_k.device) prep_k.destroy();
+        if (prep_back_k.device) prep_back_k.destroy();
+        if (transfer_prep.device) transfer_prep.destroy();
+        if (prep_keep.handle) session.ctx.destroy(prep_keep);
+        if (prep_state.handle) session.ctx.destroy(prep_state);
         if (keep.handle) session.ctx.destroy(keep);
         if (keep_full.handle) session.ctx.destroy(keep_full);
         if (full_out.handle) session.ctx.destroy(full_out);
@@ -959,7 +996,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         vkGetPhysicalDeviceFormatProperties(host.physical, in_format, &fp);
         const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         impl_->direct_in = NR_DIRECT_IN && transfer != Transfer::Identical && !impl_->scaled &&
-                           !config.linear_input && config.max_passes == 1 && mask_config.width == 0 &&
+                           !config.linear_input && !config.preprocess && config.max_passes == 1 &&
+                           mask_config.width == 0 &&
                            (fp.optimalTilingFeatures & need) == need;
         if (impl_->direct_in) {
             arguments.push_back("--tex-in-format");
@@ -1075,6 +1113,36 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                                      : impl_->linear ? &impl_->keep : shown;
         impl_->transfer_pass.create(s.ctx, (adapters / "runtime_transfer.spv").string(), {}, 36,
                                {&s.surf0, shown, keep, answer});
+    }
+    if (config.preprocess && !mask_config.width) {
+        impl_->prep = true;
+        impl_->prep_unknee = config.preprocess_unknee;
+        impl_->prep_keep = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, true);
+        s.ctx.transition(impl_->prep_keep, VK_IMAGE_LAYOUT_GENERAL);
+        // Host visible: 16 bytes the log reads (Runtime::preprocess_meter).
+        impl_->prep_state = s.ctx.buffer(16, true);
+        // Storage aliases, as the linear path's: same image and view, no sampler.
+        auto storage = [](const nrvk::Context::Image& im) {
+            nrvk::Context::Image alias = im; alias.sampler = VK_NULL_HANDLE; alias.layout = VK_IMAGE_LAYOUT_GENERAL;
+            return alias;
+        };
+        nrvk::Context::Image tex_in_st = storage(s.tex_in), keep_st = storage(impl_->prep_keep),
+                             surf0_st = storage(s.surf0);
+        const auto spv = (adapters / "runtime_prep.spv").string();
+        impl_->prep_k.create(s.ctx, spv, {impl_->prep_state.handle}, sizeof(PrepPush), {&tex_in_st, &keep_st, &surf0_st});
+        if (config.max_passes > 1) {
+            nrvk::Context::Image shown_st = storage(impl_->shown_keep);
+            impl_->prep_back_k.create(s.ctx, spv, {impl_->prep_state.handle}, sizeof(PrepPush), {&shown_st, &keep_st, &surf0_st});
+        } else if (!config.native_compose) {
+            // One pass: tex_in keeps what the network saw and the transfer pass
+            // reads the frame from prep_keep instead, as `shown` and, when
+            // tex_in was also the frame as handed over, as `keep`.
+            nrvk::Context::Image* keep = impl_->scaled ? &impl_->keep_full
+                                         : impl_->linear ? &impl_->keep : &impl_->prep_keep;
+            nrvk::Context::Image* answer = impl_->scaled ? &impl_->full_out : &s.surf0;
+            impl_->transfer_prep.create(s.ctx, (adapters / "runtime_transfer.spv").string(), {}, 36,
+                                        {&s.surf0, &impl_->prep_keep, keep, answer});
+        }
     }
     auto require_variant_profile = [&](const std::filesystem::path& directory) {
         std::ifstream manifest(directory / "shader-constants.txt");
@@ -1447,7 +1515,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     const Impl::DirectSrc* ds = nullptr;
     // post_alpha: native compose, one pass, scale 1, and no alpha pass - after
     // the network only the write-back touches the frame.
-    if (NR_DIRECT_SAMPLE && impl_->post_alpha && engine && temporal && !mask && passes == 1 &&
+    if (NR_DIRECT_SAMPLE && impl_->post_alpha && !impl_->prep && engine && temporal && !mask && passes == 1 &&
         impl_->temporal.pingpong && impl_->transfer != Transfer::Encoded &&
         (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh &&
         (!engine->depth.image || (engine->depth.format == VK_FORMAT_R32_SFLOAT &&
@@ -1541,6 +1609,41 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
+    // Preprocess: meter the frame, keep it, and put what the network is to see
+    // in tex_in. A change of settings resets the meter and, below, the history.
+    const Preprocess& pp = c.preprocess;
+    const bool prep_on = impl_->prep && pp.active() && !mask;
+    const Preprocess& was = impl_->prep_last;
+    if (impl_->prep && (prep_on != impl_->prep_was_on || (prep_on && pp != was))) ++impl_->prep_gen;
+    PrepPush prep_push{};
+    if (prep_on) {
+        const uint32_t curve = uint32_t(std::clamp(pp.curve, 0, 6));
+        const bool metered = pp.exposure == 1;
+        prep_push = {nw, nh, 0u,
+                     (metered ? kPrepAuto : 0u) | (impl_->prep_unknee ? kPrepUnknee : 0u) |
+                         (impl_->prep_was_on ? 0u : kPrepReset),
+                     curve, pp.exposure == 0 ? 0.0f : std::clamp(pp.bias_ev, -8.0f, 8.0f),
+                     std::clamp(pp.contrast, 0.5f, 2.0f), std::clamp(pp.saturation, 0.05f, 2.0f),
+                     kPrepAnchor[curve], 4.0f, 0.0f};
+        const auto now = std::chrono::steady_clock::now();
+        if (impl_->prep_was_on)
+            prep_push.dt = std::chrono::duration<float>(now - impl_->prep_metered).count();
+        impl_->prep_metered = now;
+        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        if (metered) {
+            dispatch(cmd, impl_->prep_k, 1, 1, 1, &prep_push, sizeof prep_push);
+            compute_barrier(cmd);
+        }
+        prep_push.mode = 1;
+        dispatch(cmd, impl_->prep_k, (nw + 15) / 16, (nh + 15) / 16, 1, &prep_push, sizeof prep_push);
+        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
+    impl_->prep_was_on = prep_on;
+    impl_->prep_last = pp;
     // A GENERAL -> GENERAL copy between two of our own images, fenced for the
     // compute work on either side. Model-sized, used by the multi-pass loop.
     auto copy_general = [&](const nrvk::Context::Image& src, const nrvk::Context::Image& dst) {
@@ -1604,7 +1707,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // The original's gate, all three terms, resolved here and nowhere else:
         // the first-frame latch, DLSSNR.Reset, and a motion source existing at
         // all.
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset;
+        uint32_t& gen = fs ? fs->prep_gen : impl_->prep_gen_single;
+        gate = (fs ? fs->latch : t.latch) && !temporal->reset && gen == impl_->prep_gen;
+        gen = impl_->prep_gen;
         const uint32_t p = fs ? fs->parity : t.parity;
         if (engine) {
             // Engine motion: one blit into the shared motion image, converting
@@ -1887,6 +1992,25 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         impl_->retiring.erase(impl_->retiring.begin() + long(i));
     }
     info.network_dispatches = uint32_t(s.steps.size()) * passes;
+    if (prep_on) {
+        // The answer back into the frame's own domain. With later passes the
+        // first pass's input is in shown_keep, and the frame goes back there.
+        const bool multi = impl_->max_passes > 1;
+        if (!multi)
+            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        compute_barrier(cmd);
+        prep_push.mode = 2;
+        prep_push.flags = (prep_push.flags & ~kPrepReset) | (multi ? kPrepRestore : 0u);
+        dispatch(cmd, multi ? impl_->prep_back_k : impl_->prep_k, (nw + 15) / 16, (nh + 15) / 16, 1,
+                 &prep_push, sizeof prep_push);
+        compute_barrier(cmd);
+        if (!multi)
+            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
     if (c.apply_model) {
         if (mask) {
             struct { uint32_t w,h;float intensity; } push{frame.width,frame.height,c.intensity};
@@ -1900,7 +2024,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             struct { uint32_t w, h, model_w, model_h, passthrough; float detail, colour, max_ratio, white; }
                 push{frame.width, frame.height, nw, nh, impl_->linear ? 0u : 1u,
                      c.detail_strength, c.colour_strength, c.max_ratio, impl_->white_point};
-            dispatch(cmd, impl_->transfer_pass, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, &push, sizeof push);
+            const nrvk::Kernel& transfer =
+                prep_on && impl_->transfer_prep.device ? impl_->transfer_prep : impl_->transfer_pass;
+            dispatch(cmd, transfer, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, &push, sizeof push);
             compute_barrier(cmd);
         }
         const VkImage out = impl_->scaled ? impl_->full_out.handle : s.surf0.handle;
@@ -1968,4 +2094,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
 
 float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
+std::pair<float, float> Runtime::preprocess_meter() const {
+    const float* s = static_cast<const float*>(impl_->prep_state.mapped);
+    if (!s || s[1] != 1.0f) return {NAN, NAN};
+    return {s[0], s[3]};
+}
 }  // namespace nr

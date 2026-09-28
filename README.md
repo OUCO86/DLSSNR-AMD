@@ -102,6 +102,39 @@ None of these measurements use frame generation; the OptiScaler route can turn i
 32-bit games work on Linux (use the i686 package; not with `optiscaler`). The Windows version is
 64-bit only.
 
+## Preprocess (optional)
+
+`[Preprocess]` in `dlssnr-amd.ini` in the game folder changes the picture the NR network is shown (exposure,
+display curve, contrast, saturation), and so how NR edits the picture. It has two uses: a personal look in any
+game, and fixing games that do not hand their exposure to the upscaler (below). The `optiscaler` route writes
+the file the first time the game starts; the ReShade routes also show the settings on the Add-ons page.
+
+- **Enabled**: off by default; when off, none of it runs. Turned on, it starts from auto exposure and the
+  filmic curve.
+- **Exposure**:
+  - `auto`: auto exposure after Unreal Engine's design, for games that compute their exposure but do not hand
+    it to the upscaler.
+  - `off`: the exposure stays as the game or OptiScaler set it.
+  - `fixed`: `ExposureBias` alone.
+- **ExposureBias** (EV, -8 to +8, decimals allowed): with `fixed` it is the whole gain; with `auto` it is added
+  to what auto works out.
+- **Curve, Contrast, Saturation**: change the picture NR is shown, and so how it edits the picture.
+- **Hotkey** (Ctrl+F10 by default): switches the preprocess on and off for the current run, to compare on
+  the same picture. It does not change the file.
+- **Sound**: a short sound when it switches: two notes going up for on, going down for off. `Sound = 0`
+  turns it off.
+
+Some games hand the upscaler a picture without its exposure, and NR then works on a frame that is several
+stops too dark: 007 First Light turns green and grainy with NR. Such games are fixed by the preprocess: set
+`Enabled = 1` (its defaults, auto exposure and the filmic curve, are meant for this).
+
+For a personal look in a game that gives its exposure properly, `auto` is not needed: use `Exposure = off`
+(or `fixed` for a small shift) and change `Curve`, `Contrast` or `Saturation`. This departs from the original
+look; it may be better or worse.
+
+The first time the preprocess is turned on, NR rebuilds; a second or two of frames go without NR.
+The file itself explains every setting.
+
 ## Why Vulkan (and not HIP)
 
 HIP would work too: ROCm supports RDNA4 and its matrix (WMMA) instructions. Vulkan fits this job

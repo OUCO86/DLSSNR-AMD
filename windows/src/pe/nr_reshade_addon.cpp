@@ -143,6 +143,7 @@ std::mutex lock;
 std::unique_ptr<nr::pe::Session> session;
 nr::pe::Config config;
 std::string config_path;
+nr::pe::PreprocessSwitch prep_switch;   // [Preprocess] Enabled and its hotkey
 bool vk_loaded = false;
 
 // The one runtime we feed. A game usually has one; a second one (a proxy
@@ -168,6 +169,7 @@ const nr::Controls& settings() {
             config.controls.passes, config.model_scale);
     }
     if (session) session->set_model_scale(config.model_scale);
+    config.controls.preprocess = prep_switch.frame(config.preprocess);
     return config.controls;
 }
 
@@ -921,6 +923,35 @@ void draw_overlay(effect_runtime*) {
     // This project's own: the post block's previous-frame blend.
     changed |= deferred_slider("History (previous frame blend)", config.history, config.history, 0.0f, 1.0f, 1.0f, false, nullptr);
 
+    // This project's own: [Preprocess]. Off is the upstream behaviour.
+    if (ImGui::TreeNodeEx("Preprocess", 0)) {
+        auto& p = config.preprocess.values;
+        changed |= ImGui::Checkbox("Enable preprocess", &p.enabled);
+        help_marker("Changes the picture the network is shown, and so how NR edits the picture.\n"
+                    "Off = upstream. The first time it is turned on, NR rebuilds (a second or two).");
+        if (!config.preprocess.hotkey.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s: %s", config.preprocess.hotkey.c_str(), prep_switch.on() ? "on" : "off");
+        }
+        static const char* const exposures[] = {"Off (upstream)", "Auto", "Fixed"};
+        static const char* const curves[] = {"None (upstream)", "Neutral", "Reinhard", "Filmic", "GT", "ACES", "AgX"};
+        changed |= ImGui::Combo("Exposure", &p.exposure, exposures, 3);
+        help_marker("Auto exposure after Unreal Engine's design, for games that give none;\n"
+                    "Exposure bias is added on top. Fixed uses the bias alone. When the game\n"
+                    "gives its exposure and you want your own look, use Off.");
+        changed |= deferred_slider("Exposure bias (EV)", p.bias_ev, p.bias_ev, -8.0f, 8.0f, 0.0f, false,
+                                   "Each EV doubles or halves what the network sees. 0 = upstream.\n"
+                                   "Fixed: the whole gain. Auto: added to what auto measured.");
+        changed |= ImGui::Combo("Curve", &p.curve, curves, 7);
+        help_marker("The display curve of the picture NR is shown. Test the effect yourself;\n"
+                    "the hotkey compares on the same picture.");
+        changed |= deferred_slider("Contrast", p.contrast, p.contrast, 0.5f, 2.0f, 1.0f, false,
+                                   "Of the picture NR is shown, about mid grey. 1 = upstream.");
+        changed |= deferred_slider("Saturation", p.saturation, p.saturation, 0.05f, 2.0f, 1.0f, false,
+                                   "Of the picture NR is shown, luminance kept. 1 = upstream.");
+        ImGui::TreePop();
+    }
+
     if (changed) {
         config.resolve();
         if (!config_path.empty()) config.save(config_path);
@@ -948,6 +979,20 @@ void draw_overlay(effect_runtime*) {
     else std::snprintf(line, sizeof line, "GPU cost: --");
     ImGui::TextUnformatted(line);
     if (!last_status.empty()) ImGui::TextUnformatted(last_status.c_str());
+}
+
+// Two seconds of "Preprocess: ON/OFF" in the corner after it switches, menu open or not. Drawn by
+// ReShade on the finished picture, so nothing processes it.
+void on_reshade_overlay(effect_runtime*) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (prep_switch.since_switch() > 2.0) return;
+    ImGui::SetNextWindowPos(ImVec2(24.0f, 24.0f));
+    ImGui::SetNextWindowBgAlpha(0.65f);
+    ImGui::Begin("##nr-preprocess", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    ImGui::Text("NR Preprocess: %s", prep_switch.on() ? "ON" : "OFF");
+    ImGui::End();
 }
 
 void on_render_technique(effect_runtime* rt, effect_technique t, command_list* cl,
@@ -1006,8 +1051,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         reshade::register_event<reshade::addon_event::reshade_render_technique>(on_render_technique);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_overlay(nullptr, draw_overlay);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
     } else if (reason == DLL_PROCESS_DETACH) {
         reshade::unregister_overlay(nullptr, draw_overlay);
+        reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
         // First: the filter lives in code that is about to be unmapped.
         SetUnhandledExceptionFilter(previous_filter);
         nr::pe::remove_crash_watch();

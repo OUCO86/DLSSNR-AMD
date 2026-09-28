@@ -219,7 +219,7 @@ if ($Route -eq 'optiscaler') {
     Put-File (Join-Path $here 'optiscaler\game\OptiScaler.dll') 'dxgi.dll'
     Put-File (Join-Path $here 'dxvk\dxgi.dll') 'dxgi-dxvk.dll'
     foreach ($f in 'dlssnr_core.dll', 'nvngx.dll_dlssnr.dll', 'nvngx_dlssnr.dll', 'dxgi-original.dll') { Put-File (Join-Path $here "optiscaler\$f") $f }
-    Record-Logs @('OptiScaler.log')
+    Record-Logs @('OptiScaler.log', 'dlssnr-amd.ini')
 
     $ini = Join-Path $game 'OptiScaler.ini'
     $wanted = [ordered]@{
@@ -270,6 +270,7 @@ Say "Installed into: $game"
 if ($Route -eq 'optiscaler') {
     Say 'In the game, turn on DLSS (or FSR / XeSS) in the graphics settings. Insert opens the OptiScaler menu;'
     Say 'the NR settings are on the DLSS Neural Rendering page.'
+    Say 'If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game.'
 } else {
     Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini in the game folder.'
 }

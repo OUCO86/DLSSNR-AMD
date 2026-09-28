@@ -1,12 +1,18 @@
-// dlssnr-amd.ini: the ReShade add-on's settings. Re-read while the game runs.
+// dlssnr-amd.ini: the ReShade add-on's settings, and [Preprocess] for every
+// route. Re-read while the game runs.
 #include "nr_pe_config.hpp"
+#include "nr_pe_log.hpp"
 
 #include <windows.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace nr::pe {
 namespace {
@@ -52,6 +58,89 @@ bool set_pass_field(PassOverride& o, const std::string& field, const std::string
     return true;
 }
 
+const char* const kCurves[] = {"none", "neutral", "reinhard", "filmic", "gt", "aces", "agx"};
+const char* const kExposures[] = {"off", "auto", "fixed"};
+
+// "Ctrl+Shift+F10" -> a virtual key and MOD_* bits; false when unreadable.
+bool parse_hotkey(const std::string& text, int& vk, int& mods) {
+    vk = 0; mods = 0;
+    std::string rest = lower(text);
+    while (!rest.empty()) {
+        const auto plus = rest.find('+');
+        const std::string part = trim(rest.substr(0, plus));
+        rest = plus == std::string::npos ? std::string() : rest.substr(plus + 1);
+        if (part == "ctrl" || part == "control") mods |= MOD_CONTROL;
+        else if (part == "shift") mods |= MOD_SHIFT;
+        else if (part == "alt") mods |= MOD_ALT;
+        else if (vk) return false;
+        else if (part.size() >= 2 && part[0] == 'f' && std::isdigit(static_cast<unsigned char>(part[1]))) {
+            const int n = std::atoi(part.c_str() + 1);
+            if (n < 1 || n > 24) return false;
+            vk = VK_F1 + n - 1;
+        } else if (part.size() == 1 && std::isalnum(static_cast<unsigned char>(part[0])))
+            vk = std::toupper(static_cast<unsigned char>(part[0]));
+        else if (part == "insert") vk = VK_INSERT;
+        else if (part == "delete") vk = VK_DELETE;
+        else if (part == "home") vk = VK_HOME;
+        else if (part == "end") vk = VK_END;
+        else if (part == "pageup") vk = VK_PRIOR;
+        else if (part == "pagedown") vk = VK_NEXT;
+        else if (part == "pause") vk = VK_PAUSE;
+        else if (part == "scrolllock") vk = VK_SCROLL;
+        else return false;
+    }
+    return vk != 0;
+}
+
+bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+// The switch's cue, a WAV made here: two notes going up for on (660 -> 990 Hz), two going down for
+// off (990 -> 495 Hz), 110 ms each, soft. Played on a thread of its own; winmm is loaded on first use, never
+// imported, so nothing about loading this module changes.
+std::vector<char> make_cue(bool on) {
+    const int rate = 44100, note = rate * 11 / 100, gap = rate / 50;
+    // -20 dBFS, about a system notification: quiet enough not to startle on a loud system.
+    const float kLevel = 0.1f;
+    const float hz[2] = {on ? 660.0f : 990.0f, on ? 990.0f : 495.0f};
+    std::vector<int16_t> pcm;
+    for (int k = 0; k < 2; ++k) {
+        for (int i = 0; i < note; ++i) {
+            const float env = std::min({1.0f, float(i) / (0.01f * rate), float(note - i) / (0.03f * rate)});
+            pcm.push_back(int16_t(kLevel * 32767.0f * env * std::sin(6.2831853f * hz[k] * float(i) / float(rate))));
+        }
+        if (k == 0) pcm.insert(pcm.end(), size_t(gap), int16_t(0));
+    }
+    const uint32_t data = uint32_t(pcm.size() * 2);
+    std::vector<char> wav(44 + data);
+    auto put32 = [&](size_t at, uint32_t v) { std::memcpy(&wav[at], &v, 4); };
+    auto put16 = [&](size_t at, uint16_t v) { std::memcpy(&wav[at], &v, 2); };
+    std::memcpy(&wav[0], "RIFF", 4); put32(4, 36 + data); std::memcpy(&wav[8], "WAVEfmt ", 8);
+    put32(16, 16); put16(20, 1); put16(22, 1); put32(24, uint32_t(rate)); put32(28, uint32_t(rate * 2));
+    put16(32, 2); put16(34, 16); std::memcpy(&wav[36], "data", 4); put32(40, data);
+    std::memcpy(&wav[44], pcm.data(), data);
+    return wav;
+}
+
+void play_cue(bool on) {
+    static const std::vector<char> cues[2] = {make_cue(false), make_cue(true)};
+    std::thread([on] {
+        using PlaySoundFn = BOOL(WINAPI*)(LPCSTR, HMODULE, DWORD);
+        static const PlaySoundFn play = [] {
+            const HMODULE winmm = LoadLibraryA("winmm.dll");
+            return winmm ? reinterpret_cast<PlaySoundFn>(GetProcAddress(winmm, "PlaySoundA")) : nullptr;
+        }();
+        const DWORD kMemory = 0x0004, kNoDefault = 0x0002;   // SND_MEMORY | SND_NODEFAULT, synchronous
+        if (play) play(cues[on ? 1 : 0].data(), nullptr, kMemory | kNoDefault);
+    }).detach();
+}
+
+// Only while one of this process's windows has the focus.
+bool focused() {
+    DWORD pid = 0;
+    const HWND w = GetForegroundWindow();
+    return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
+}
+
 // Parse one file into `c`. Returns false if it could not be opened. `legacy`
 // is set when the file uses the old lowercase keys (before 2026-09-23).
 bool parse(const std::string& path, Config& c, bool& legacy) {
@@ -59,6 +148,7 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     if (!file) return false;
     int passes = c.controls.passes;
     bool section = false;
+    std::string name;   // the current section, lower case
     char line[512];
     while (std::fgets(line, sizeof line, file)) {
         std::string text = line;
@@ -66,11 +156,17 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         if (comment != std::string::npos) text = text.substr(0, comment);
         text = trim(text);
         if (text.empty()) continue;
-        if (text.front() == '[') { section = true; continue; }
+        if (text.front() == '[') {
+            section = true;
+            name = lower(trim(text.substr(1, text.find(']') == std::string::npos ? std::string::npos
+                                                                                 : text.find(']') - 1)));
+            continue;
+        }
         const auto equals = text.find('=');
         if (equals == std::string::npos) continue;
         const std::string key = lower(trim(text.substr(0, equals)));
         const std::string value = trim(text.substr(equals + 1));
+        if (name == "preprocess") { parse_preprocess_key(c.preprocess, key, value); continue; }
         if (value.empty()) continue;
         auto& k = c.controls;
 
@@ -111,7 +207,180 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
     return true;
 }
 
+// The [Preprocess] section of `path` alone into `p`. False if it could not be opened.
+bool parse_preprocess_file(const std::string& path, PreprocessConfig& p) {
+    FILE* file = std::fopen(path.c_str(), "r");
+    if (!file) return false;
+    std::string name;
+    char line[512];
+    while (std::fgets(line, sizeof line, file)) {
+        std::string text = line;
+        const auto comment = text.find_first_of(";#");
+        if (comment != std::string::npos) text = text.substr(0, comment);
+        text = trim(text);
+        if (text.empty()) continue;
+        if (text.front() == '[') {
+            const auto close = text.find(']');
+            name = lower(trim(text.substr(1, close == std::string::npos ? std::string::npos : close - 1)));
+            continue;
+        }
+        const auto equals = text.find('=');
+        if (equals == std::string::npos || name != "preprocess") continue;
+        parse_preprocess_key(p, lower(trim(text.substr(0, equals))), trim(text.substr(equals + 1)));
+    }
+    std::fclose(file);
+    return true;
+}
+
 }  // namespace
+
+bool parse_preprocess_key(PreprocessConfig& p, const std::string& key, const std::string& value) {
+    auto& v = p.values;
+    const std::string low = lower(value);
+    if (key == "enabled") { if (auto b = parse_bool(value)) v.enabled = *b; }
+    else if (key == "exposure") {
+        for (int i = 0; i < 3; ++i) if (low == kExposures[i]) v.exposure = i;
+    } else if (key == "exposurebias") v.bias_ev = number(value, -8, 8);
+    else if (key == "curve") {
+        for (int i = 0; i < 7; ++i) if (low == kCurves[i]) v.curve = i;
+    } else if (key == "contrast") v.contrast = number(value, 0.5f, 2);
+    else if (key == "saturation") v.saturation = number(value, 0.05f, 2);
+    else if (key == "hotkey") p.hotkey = value;
+    else if (key == "sound") { if (auto b = parse_bool(value)) p.sound = *b; }
+    else return false;
+    return true;
+}
+
+std::string describe(const Preprocess& p) {
+    char text[160];
+    std::snprintf(text, sizeof text, "exposure %s, ExposureBias %+.2f EV, curve %s, contrast %.2f, saturation %.2f",
+                  kExposures[std::clamp(p.exposure, 0, 2)], p.exposure == 0 ? 0.0f : p.bias_ev,
+                  kCurves[std::clamp(p.curve, 0, 6)], p.contrast, p.saturation);
+    return text;
+}
+
+void write_preprocess(FILE* f, const PreprocessConfig& p) {
+    const auto& v = p.values;
+    std::fprintf(f,
+        "[Preprocess]\n"
+        "; Changes the picture the NR network is shown (exposure, display curve, contrast, saturation),\n"
+        "; and so how NR edits the picture.\n"
+        "; Two uses:\n"
+        ";   - a personal look, in any game: change the settings below. It departs from the original look;\n"
+        ";     it may be better or worse.\n"
+        ";   - games that do not hand their exposure to the upscaler: NR gets a picture several stops too\n"
+        ";     dark and turns it green and grainy (007 First Light); turning it on fixes that.\n"
+        "; Values marked [upstream] are the same as off; with every value at [upstream] nothing runs.\n"
+        "; Numbers may have decimals.\n"
+        "; The first time it is turned on (the hotkey too) NR rebuilds, and a second or two of frames\n"
+        "; go without NR.\n"
+        "\n"
+        "Enabled = %d\n"
+        "; 0 = off, nothing runs (default)\n"
+        "; 1 = on, starting from auto exposure and the filmic curve. Hotkey also switches it for this\n"
+        ";     run, without writing this file\n"
+        "\n"
+        "Exposure = %s\n"
+        "; off   = no exposure change [upstream] (the game's exposure when it gives one, else a fixed white point)\n"
+        "; auto  = auto exposure after Unreal Engine's design: adjusts to the picture's brightness, up or\n"
+        ";         down, and follows scene changes smoothly. For games that give no exposure, such as 007\n"
+        ";         First Light. When a game gives its exposure properly and you want your own colour look,\n"
+        ";         use off, not auto\n"
+        "; fixed = no automatic change; ExposureBias alone\n"
+        "\n"
+        "ExposureBias = %.2f\n"
+        "; exposure compensation in EV (stops), -8 .. +8. 0 = none [upstream]\n"
+        "; every stop is a factor of 2: +1 = the network sees it twice as bright, -1 = half\n"
+        "; fixed: the whole gain, the same every frame\n"
+        "; auto:  added to what auto works out; the sum is the gain. Auto +4.5 with ExposureBias = 0.5 =\n"
+        ";        5 stops up\n"
+        "; off:   unused\n"
+        "\n"
+        "Curve = %s\n"
+        "; the display curve of the picture the NR network is shown. Test the effect yourself; the hotkey\n"
+        "; compares on the same picture\n"
+        "; none = no change [upstream], neutral, reinhard, filmic, gt, aces, agx\n"
+        "\n"
+        "Contrast = %.2f\n"
+        "; contrast of the picture the NR network is shown, about mid grey, 0.5 .. 2. 1.0 = no change\n"
+        "; [upstream]\n"
+        "\n"
+        "Saturation = %.2f\n"
+        "; saturation of the picture the NR network is shown, 0.05 .. 2 (not 0). 1.0 = no change [upstream]\n"
+        "\n"
+        "Hotkey = %s\n"
+        "; switches the whole preprocess on and off in the game (flips Enabled for this run), to compare\n"
+        "; on the same picture. Never written to this file. Empty = no hotkey. Ctrl, Shift, Alt and one\n"
+        "; key, e.g. Alt+F9\n"
+        "\n"
+        "Sound = %d\n"
+        "; a short sound when it switches (hotkey or this file): two notes going up = on, going down = off.\n"
+        "; 0 = silent\n",
+        v.enabled ? 1 : 0, kExposures[std::clamp(v.exposure, 0, 2)], v.bias_ev,
+        kCurves[std::clamp(v.curve, 0, 6)], v.contrast, v.saturation, p.hotkey.c_str(), p.sound ? 1 : 0);
+}
+
+bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
+    const uint64_t stamp = stamp_of(path);
+    if (!stamp) {
+        if (tried_) return false;
+        tried_ = true;
+        // No file: write one with the defaults, off, so there is something to edit.
+        if (FILE* f = std::fopen(path.c_str(), "w")) {
+            write_preprocess(f, PreprocessConfig{});
+            std::fclose(f);
+            stamp_ = stamp_of(path);
+        }
+        out = PreprocessConfig{};
+        return true;
+    }
+    if (stamp == stamp_) return false;
+    PreprocessConfig next{};
+    if (!parse_preprocess_file(path, next)) return false;
+    stamp_ = stamp;
+    tried_ = true;
+    out = next;
+    return true;
+}
+
+Preprocess PreprocessSwitch::frame(const PreprocessConfig& file) {
+    if (file.hotkey != key_text_) {
+        key_text_ = file.hotkey;
+        if (!key_text_.empty() && !parse_hotkey(key_text_, vk_, mods_)) {
+            log("[nr] preprocess: Hotkey \"%s\" not understood; no hotkey", key_text_.c_str());
+            vk_ = 0;
+        } else if (key_text_.empty()) vk_ = 0;
+    }
+    if (file.values.enabled != file_enabled_) { file_enabled_ = file.values.enabled; have_override_ = false; }
+    if (vk_) {
+        const bool down = key_down(vk_) && ((mods_ & MOD_CONTROL) != 0) == key_down(VK_CONTROL) &&
+                          ((mods_ & MOD_SHIFT) != 0) == key_down(VK_SHIFT) &&
+                          ((mods_ & MOD_ALT) != 0) == key_down(VK_MENU);
+        if (down && !down_ && focused()) {
+            override_ = !(have_override_ ? override_ : file_enabled_);
+            have_override_ = true;
+        }
+        down_ = down;
+    }
+    Preprocess p = file.values;
+    p.enabled = have_override_ ? override_ : file_enabled_;
+    const bool on = p.active();
+    if (logged_ && on != last_on_) {
+        switched_ms_ = GetTickCount64();
+        if (file.sound) play_cue(on);
+    }
+    if (!logged_ || on != last_on_ || (on && p != last_)) {
+        if (on) log("[nr] preprocess on: %s", describe(p).c_str());
+        else if (logged_) log("[nr] preprocess off");
+        logged_ = true;
+    }
+    last_on_ = on; last_ = p;
+    return p;
+}
+
+double PreprocessSwitch::since_switch() const {
+    return switched_ms_ ? double(GetTickCount64() - switched_ms_) / 1000.0 : 1e9;
+}
 
 void Config::resolve() {
     auto& k = controls;
@@ -207,6 +476,8 @@ void Config::save(const std::string& path) {
         "; Log a line for every skipped frame\n"
         "Verbose=%s\n",
         history, white_point, flag(verbose));
+    std::fputs("\n", f);
+    write_preprocess(f, preprocess);
     std::fclose(f);
     stamp_ = stamp_of(path);
 }

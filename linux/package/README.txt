@@ -73,6 +73,14 @@ optiscaler: turn on DLSS, FSR or XeSS in the game; Insert opens the OptiScaler m
 reshade / vulkan / dx9: Home opens ReShade, the settings are on the Add-ons page; the same
             settings are kept in dlssnr-amd.ini in the game folder and changes apply live.
 
+Preprocess (optional, off by default): [Preprocess] in dlssnr-amd.ini in the game folder (the
+optiscaler route writes the file on first start; the ReShade routes also show it on the Add-ons
+page). It changes the picture the network is shown (exposure, display curve, contrast,
+saturation), and so how NR edits the picture. Two uses: a personal look in any game (it departs
+from the original look; the result may be better or worse), and games that do not hand their
+exposure to the upscaler, which it fixes (see 007 First Light below). Ctrl+F10 switches it for
+the current run, to compare. The file explains every setting.
+
 Logs: dlssnr-amd.log (and OptiScaler.log or ReShade.log), all in the game folder.
 
 Known issues
@@ -81,10 +89,9 @@ Known issues
   ReShade compiles its shaders for the first time); the second launch works.
 - 007 First Light (optiscaler route): with NR before or after the upscaler the picture turns
   dark, green and grainy. The game leaves exposure to the upscaler and hands over none, so the
-  frame NR gets is far too dark. Either lower Paper white on the DLSS Neural Rendering page of
-  the OptiScaler menu (about 0.06; [DlssNr] WhitePointScale in OptiScaler.ini), or set
-  [DlssNr] FinishedPicture=true so NR works on the finished picture (the HUD is then processed
-  as well).
+  frame NR gets is far too dark. Turn on Preprocess (above); its defaults are meant for this.
+  The older workarounds, lowering Paper white on the DLSS Neural Rendering page (about 0.06;
+  [DlssNr] WhitePointScale) or [DlssNr] FinishedPicture=true, are no longer recommended.
 
 Uninstall
 ---------
