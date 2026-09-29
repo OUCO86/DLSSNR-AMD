@@ -718,7 +718,7 @@ void feed(effect_runtime* rt, command_list* cl, resource_view rtv) {
         // C-style cast is the one spelling valid for a pointer (x64) and an
         // integer (x86) alike.
         f.colour = (VkImage)colour.handle;
-        f.colour_format = nr::pe::vulkan_format_of(static_cast<DXGI_FORMAT>(cd.texture.format));
+        f.colour_format = nr::pe::vulkan_colour_format_of(static_cast<DXGI_FORMAT>(cd.texture.format));
         f.width = w; f.height = h_;
         if (motion.handle) {
             const resource_desc md = rs::call(dev, &device::get_resource_desc, motion);

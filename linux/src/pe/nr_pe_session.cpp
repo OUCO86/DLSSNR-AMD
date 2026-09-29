@@ -159,7 +159,11 @@ struct Session::Impl {
     std::chrono::steady_clock::time_point meter_logged{};
     static bool is_linear_format(VkFormat f) {
         return f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
-               f == VK_FORMAT_R32G32B32A32_SFLOAT;
+               f == VK_FORMAT_R32G32B32A32_SFLOAT ||
+               // Taken only through the rest-of-DXGI colour formats
+               // (nr_pe_interop.cpp colour_format_fallback), so no frame that
+               // ran before changes its answer here.
+               f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 || f == VK_FORMAT_R32G32B32_SFLOAT;
     }
     // The background build. Everything the thread needs is copied in; it hands
     // back either a runtime or an error under `build_lock`, and the render
@@ -795,7 +799,7 @@ bool Session::Impl::ensure_output(ID3D12Device* device, uint32_t w, uint32_t h, 
         status = "could not allocate the render-resolution output";
         return false;
     }
-    output_vk = resource_handle(device, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    output_vk = colour_handle(device, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (!output_vk.usable()) {
         release_output();
         status = "the output has no Vulkan image; this is not vkd3d-proton";
@@ -976,7 +980,7 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
         log("[nr] %s", s.status.c_str());
         return nullptr;
     }
-    const auto colour_vk = resource_handle(device, colour, colour_state);
+    const auto colour_vk = colour_handle(device, colour, colour_state);
     if (!colour_vk.usable()) {
         s.status = describe_rejection(colour_vk, "colour");
         return nullptr;
@@ -1074,7 +1078,7 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!s.ensure_d3d12_device(device)) return false;
     const VkCommandBuffer cmd = command_buffer(list);
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
-    const auto target = resource_handle(device, output, output_state);
+    const auto target = colour_handle(device, output, output_state);
     if (!target.usable()) { s.status = describe_rejection(target, "output"); return false; }
     if (!s.ensure_runtime(controls, target.width, target.height, target.format,
                           !resources.colour_encoded &&
@@ -1159,7 +1163,7 @@ bool Session::run_present(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     if (!s.ensure_d3d12_device(device)) return false;
     const VkCommandBuffer cmd = command_buffer(list);
     if (!cmd) { s.status = "the command list exposes no Vulkan handle"; s.failed = true; return false; }
-    const auto target = resource_handle(device, back_buffer, D3D12_RESOURCE_STATE_PRESENT);
+    const auto target = colour_handle(device, back_buffer, D3D12_RESOURCE_STATE_PRESENT);
     if (!target.usable()) { s.status = describe_rejection(target, "back buffer"); return false; }
     if (!s.ensure_runtime(controls, target.width, target.height, target.format, false)) return false;
 

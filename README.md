@@ -6,7 +6,12 @@ graphics cards.
 - The network is reimplemented as Vulkan compute shaders.
 - The model is not included. The installer extracts it from your own copy of `nvngx_dlssnr.dll`
   (version 310.8.0).
-- The output is close to NVIDIA's, but not identical.
+- The Linux build, on an RX 9070 XT, checked against NVIDIA's own `nvngx_dlssnr.dll` run on an
+  RTX 5090 through NGX (the way a game calls it), with the same input frame and settings: PSNR
+  45.56 dB at 1080p, 47.99 dB at 1440p and 49.06 dB at 4K (higher is closer; the input frame itself
+  scores 26-29 dB), SSIM 0.996-0.997 (1 = identical). NVIDIA's DLL gives byte-identical output from
+  run to run, so the difference is between the two implementations, not noise. Method, pictures and
+  data: [docs/ngx-verification](docs/ngx-verification/NGX-VERIFICATION.md).
 - **Tested only on an RX 9070 XT.** Other cards are not guaranteed to work.
 - **The Windows version is still in development and has serious problems.** It is clearly slower than
   Linux, several games crash or do not work, and it is not ready for normal use. The current Windows

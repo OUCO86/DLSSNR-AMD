@@ -56,10 +56,48 @@ VkFormat vulkan_format(DXGI_FORMAT format) {
     }
 }
 
+// The rest of DXGI's RGB colour formats, for a colour image only. With the table
+// above this is every non-integer, uncompressed DXGI format that carries red,
+// green and blue, except R10G10B10_XR_BIAS_A2 (a biased encoding a blit would
+// read as plain UNORM) and the two subsampled R8G8_B8G8/G8R8_G8B8. DXGI's list
+// is closed, so nothing can be missing from it later.
+//
+// The VkFormat is vkd3d-proton's own (libs/vkd3d/utils.c, the format table,
+// read from its source): the 16-bit packed ones name their bits from the other
+// end in Vulkan, so B5G6R5 is R5G6B5_PACK16 and so on - the same bits. Where
+// vkd3d can say which VkFormat it used (colour_handle) its answer is taken
+// instead; this table is for the vkd3d versions that cannot.
+//
+// Separate from vulkan_format() so that every format already accepted keeps
+// exactly the path it had: this is only consulted where that table says no.
+VkFormat colour_format_fallback(DXGI_FORMAT format) {
+    if (unsigned(format) == 191) return VK_FORMAT_R4G4B4A4_UNORM_PACK16;   // A4B4G4R4_UNORM (newer than mingw's header)
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case DXGI_FORMAT_R32G32B32_TYPELESS: return VK_FORMAT_R32G32B32_SFLOAT;
+    case DXGI_FORMAT_R32G32B32_FLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
+    case DXGI_FORMAT_R16G16B16A16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+    case DXGI_FORMAT_R8G8B8A8_SNORM: return VK_FORMAT_R8G8B8A8_SNORM;
+    // RE Engine's upscaler colour and output (Resident Evil Requiem, Monster
+    // Hunter Wilds): three 9-bit mantissas sharing a 5-bit exponent, unsigned,
+    // linear like R11G11B10.
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case DXGI_FORMAT_B8G8R8X8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return VK_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+    case DXGI_FORMAT_B5G6R5_UNORM: return VK_FORMAT_R5G6B5_UNORM_PACK16;
+    case DXGI_FORMAT_B5G5R5A1_UNORM: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+    case DXGI_FORMAT_B4G4R4A4_UNORM: return VK_FORMAT_A4R4G4B4_UNORM_PACK16;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 bool is_typeless(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
         return true;
     default: return false;
     }
@@ -99,6 +137,23 @@ VkFormat depth_stencil_format(ID3D12DXVKInteropDevice* interop, const D3D12_RESO
 }  // namespace
 
 VkFormat vulkan_format_of(DXGI_FORMAT format) { return vulkan_format(format); }
+
+bool format_fallback_enabled() {
+    static const bool on = [] {
+        char v[8] = {};
+        const DWORD n = GetEnvironmentVariableA("NR_FORMAT_FALLBACK", v, sizeof v);
+        const bool off = n > 0 && n < sizeof v && v[0] == '0';
+        if (off) log("[nr] NR_FORMAT_FALLBACK=0: only the colour formats of the original table are taken");
+        return !off;
+    }();
+    return on;
+}
+
+VkFormat vulkan_colour_format_of(DXGI_FORMAT format) {
+    const VkFormat known = vulkan_format(format);
+    if (known != VK_FORMAT_UNDEFINED || !format_fallback_enabled()) return known;
+    return colour_format_fallback(format);
+}
 
 DeviceHandles device_handles(ID3D12Device* device) {
     DeviceHandles out{};
@@ -155,6 +210,63 @@ ResourceHandle resource_handle(ID3D12Device* device, ID3D12Resource* resource,
         // format *was*, and that is the one thing a rejection has to report.
     }
     interop->Release();
+    return out;
+}
+
+// A colour image in a format the table above declines gets one more look, and
+// nothing else changes: a format the table knows returns exactly what
+// resource_handle returned, so every game that already runs runs the same code.
+//
+// The format has to be one of DXGI's RGB colour formats (colour_format_fallback);
+// the VkFormat is the one vkd3d says it created the image with where it can say,
+// and it has to be something this GPU can blit from and to and blend - the pass
+// moves the frame in and out with vkCmdBlitImage, and blending is what no
+// integer format has, so a typeless family vkd3d happened to create as UINT is
+// declined here rather than blitted into a float image.
+ResourceHandle colour_handle(ID3D12Device* device, ID3D12Resource* resource,
+                             D3D12_RESOURCE_STATES state) {
+    ResourceHandle out = resource_handle(device, resource, state);
+    if (!out || out.format != VK_FORMAT_UNDEFINED || !format_fallback_enabled()) return out;
+    VkFormat format = colour_format_fallback(out.dxgi);
+    if (format == VK_FORMAT_UNDEFINED) return out;
+    ID3D12DXVKInteropDevice* interop = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice),
+                                      reinterpret_cast<void**>(&interop))) || !interop)
+        return out;
+    const char* source = "the DXGI table";
+    ID3D12DXVKInteropDevice1* interop1 = nullptr;
+    if (SUCCEEDED(interop->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1),
+                                          reinterpret_cast<void**>(&interop1))) && interop1) {
+        UINT64 handle = 0, offset = 0;
+        VkFormat created = VK_FORMAT_UNDEFINED;
+        if (SUCCEEDED(interop1->GetVulkanResourceInfo1(resource, &handle, &offset, &created)) &&
+            created != VK_FORMAT_UNDEFINED) {
+            format = created;
+            source = "vkd3d-proton";
+        }
+        interop1->Release();
+    }
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice vk_device = VK_NULL_HANDLE;
+    interop->GetVulkanHandles(&instance, &physical, &vk_device);
+    interop->Release();
+    if (!physical) return out;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(physical, format, &fp);
+    constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+    const bool usable = (fp.optimalTilingFeatures & need) == need;
+    static std::mutex lock;
+    static std::set<unsigned> said;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        if (said.insert(unsigned(out.dxgi)).second)
+            log("[nr] colour DXGI format %u: VkFormat %u (from %s), %s", unsigned(out.dxgi), unsigned(format),
+                source, usable ? "taken" : "declined: this GPU cannot blit and blend it");
+    }
+    if (usable) out.format = format;
+    else out.unblittable = format;
     return out;
 }
 
@@ -372,6 +484,11 @@ std::string describe_rejection(const ResourceHandle& handle, const char* what) {
     if (!handle) {
         std::snprintf(text, sizeof text,
                       "vkd3d-proton returned no Vulkan image for the %s resource", what);
+    } else if (handle.unblittable != VK_FORMAT_UNDEFINED) {
+        std::snprintf(text, sizeof text,
+                      "the %s resource is DXGI format %u (VkFormat %u) at %ux%u, which this GPU cannot "
+                      "blit and blend", what, unsigned(handle.dxgi), unsigned(handle.unblittable),
+                      handle.width, handle.height);
     } else {
         std::snprintf(text, sizeof text,
                       "the %s resource is DXGI format %u at %ux%u, which this pass does not accept",

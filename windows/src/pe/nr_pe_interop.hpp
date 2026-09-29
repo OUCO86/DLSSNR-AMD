@@ -49,6 +49,26 @@ ID3D12DXVKInteropDevice : public IUnknown
     virtual HRESULT STDMETHODCALLTYPE UnlockCommandQueue(ID3D12CommandQueue* pCommandQueue) = 0;
 };
 
+// vkd3d-proton 2.13 and later (include/vkd3d_device_vkd3d_ext.idl): the same
+// resource query, plus the VkFormat vkd3d created the image with
+// (libs/vkd3d/device_vkd3d_ext.c: resource->format->vk_format). Only the first
+// method is called; the rest are listed so the vtable is the real one.
+MIDL_INTERFACE("902d8115-59eb-4406-9518-fe00f991ee65")
+ID3D12DXVKInteropDevice1 : public ID3D12DXVKInteropDevice
+{
+    virtual HRESULT STDMETHODCALLTYPE GetVulkanResourceInfo1(ID3D12Resource* pResource, UINT64* pVkHandle,
+                                                             UINT64* pBufferOffset, VkFormat* pFormat) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateInteropCommandQueue(const D3D12_COMMAND_QUEUE_DESC* pDesc,
+                                                                UINT32 vk_queue_family_index,
+                                                                ID3D12CommandQueue** ppQueue) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateInteropCommandAllocator(D3D12_COMMAND_LIST_TYPE type,
+                                                                    UINT32 vk_queue_family_index,
+                                                                    ID3D12CommandAllocator** ppAllocator) = 0;
+    virtual HRESULT STDMETHODCALLTYPE BeginVkCommandBufferInterop(ID3D12CommandList* pCmdList,
+                                                                  VkCommandBuffer* pCommandBuffer) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EndVkCommandBufferInterop(ID3D12CommandList* pCmdList) = 0;
+};
+
 // DXVK, for D3D11 games. Transcribed from dxvk/src/dxgi/dxgi_interfaces.h, not
 // from memory: a wrong vtable order here is a crash inside someone's game.
 //
@@ -90,6 +110,8 @@ __CRT_UUID_DECL(ID3D12GraphicsCommandListExt, 0x77a86b09, 0x2bea, 0x4801,
                 0xb8, 0x9a, 0x37, 0x64, 0x8e, 0x10, 0x4a, 0xf1)
 __CRT_UUID_DECL(ID3D12DXVKInteropDevice, 0x39da4e09, 0xbd1c, 0x4198,
                 0x9f, 0xae, 0x86, 0xbb, 0xe3, 0xbe, 0x41, 0xfd)
+__CRT_UUID_DECL(ID3D12DXVKInteropDevice1, 0x902d8115, 0x59eb, 0x4406,
+                0x95, 0x18, 0xfe, 0x00, 0xf9, 0x91, 0xee, 0x65)
 __CRT_UUID_DECL(IDXGIVkInteropSurface, 0x5546cf8c, 0x77e7, 0x4341,
                 0xb0, 0x5d, 0x8d, 0x4d, 0x50, 0x00, 0xe7, 0x7d)
 __CRT_UUID_DECL(IDXGIVkInteropDevice, 0xe2ef5fa5, 0xdc21, 0x4af7,
@@ -110,6 +132,13 @@ struct DeviceHandles {
 // formats exactly like DXGI, so its Vulkan backend's descriptions go through
 // here too.
 VkFormat vulkan_format_of(DXGI_FORMAT format);
+// The same for a colour image (the frame, an output, a back buffer), which also
+// takes the rest of DXGI's RGB colour formats - see colour_format_fallback() in
+// the definition. Motion and depth keep vulkan_format_of.
+VkFormat vulkan_colour_format_of(DXGI_FORMAT format);
+// NR_FORMAT_FALLBACK=0 turns the rest-of-DXGI colour formats off everywhere, so a
+// frame in one of them is declined as it was before they were taken.
+bool format_fallback_enabled();
 
 // Resolve the game's Vulkan device from its D3D12 device. Returns an invalid
 // set when the runtime underneath is not vkd3d-proton - which is what happens
@@ -136,6 +165,9 @@ struct ResourceHandle {
     // The D3D12 format the resource was created with, kept so a rejection can
     // say which format it was. Zero (UNKNOWN) on the DXVK path.
     DXGI_FORMAT dxgi{DXGI_FORMAT_UNKNOWN};
+    // Set by colour_handle when the format is one of the rest-of-DXGI colour
+    // formats but this GPU cannot blit it: the VkFormat, for the rejection.
+    VkFormat unblittable{VK_FORMAT_UNDEFINED};
     // The image exists. Says nothing about `format`: a resource in a format the
     // pass does not handle still comes back with its VkImage and
     // format == VK_FORMAT_UNDEFINED, so the caller can log what it was.
@@ -144,6 +176,11 @@ struct ResourceHandle {
 };
 ResourceHandle resource_handle(ID3D12Device* device, ID3D12Resource* resource,
                                D3D12_RESOURCE_STATES state);
+// resource_handle for a colour image. Identical whenever resource_handle already
+// knows the format; only a format it declines is looked at again (see the
+// definition).
+ResourceHandle colour_handle(ID3D12Device* device, ID3D12Resource* resource,
+                             D3D12_RESOURCE_STATES state);
 // Why a handle cannot be used, with the DXGI format number in it. `what` names
 // the resource ("colour", "output", "back buffer") for the log line.
 std::string describe_rejection(const ResourceHandle& handle, const char* what);

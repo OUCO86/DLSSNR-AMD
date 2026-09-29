@@ -165,9 +165,36 @@ Transfer transfer_mode(VkFormat format) {
         case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
             return Transfer::DirectBlit;
         default:
-            throw std::invalid_argument("unsupported NR colour format, VkFormat " +
-                                        std::to_string(unsigned(format)));
+            break;
     }
+    // Every other RGB colour format a frame can come in, if NR_FORMAT_FALLBACK is
+    // not 0. The cases above keep their paths; this is only reached by a format
+    // that used to be refused here. Blitting converts each of these to RGBA32F
+    // and back by the format's own definition, and the constructor checks this
+    // GPU can blit it before anything is built. Left out on purpose: integer
+    // formats (a blit cannot convert them to float), sRGB ones other than the
+    // two above (a blit would decode their transfer function, which the network
+    // must not see), block-compressed and depth formats.
+    const char* fallback = std::getenv("NR_FORMAT_FALLBACK");
+    if (!(fallback && fallback[0] == '0')) switch(format) {
+        case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+        case VK_FORMAT_R32G32B32_SFLOAT: case VK_FORMAT_R16G16B16_SFLOAT:
+        case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16_UNORM: case VK_FORMAT_R16G16B16_SNORM:
+        case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_B8G8R8A8_SNORM:
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SNORM_PACK32:
+        case VK_FORMAT_R8G8B8_UNORM: case VK_FORMAT_R8G8B8_SNORM:
+        case VK_FORMAT_B8G8R8_UNORM: case VK_FORMAT_B8G8R8_SNORM:
+        case VK_FORMAT_A2R10G10B10_SNORM_PACK32: case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+        case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_B5G6R5_UNORM_PACK16:
+        case VK_FORMAT_R5G5B5A1_UNORM_PACK16: case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
+        case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+        case VK_FORMAT_R4G4B4A4_UNORM_PACK16: case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_A4R4G4B4_UNORM_PACK16: case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
+            return Transfer::DirectBlit;
+        default:
+            break;
+    }
+    throw std::invalid_argument("unsupported NR colour format, VkFormat " + std::to_string(unsigned(format)));
 }
 
 VkFormat encoded_format(VkFormat format) {

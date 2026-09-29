@@ -669,6 +669,85 @@ void fix_release_hold(const Module& m) {
         static_cast<unsigned long long>(static_cast<uint8_t*>(targets[1]) - m.base));
 }
 
+// ---- 7. Every float colour format counts as float ----------------------------------------------
+//
+// Right after the flag test fix 5 changes, MakeDlssNrPass clears ColourIsLinearHdr unless the output
+// (or colour) is one of R32G32B32A32 typeless/float, R32G32B32 float, R16G16B16A16 typeless/float or
+// R11G11B10 float (DlssNr_Pipeline_Dx12.cpp: a switch, compiled into a jump table over formats 1..26
+// whose out-of-range side is the clearing store). R9G9B9E5_SHAREDEXP (67) is float too and is what
+// RE Engine hands its upscaler: Resident Evil Requiem creates its FSR context with IsHdr set and a
+// format-67 colour, and OptiScaler then logs "the game's DLSS colour space is already tone-mapped",
+// sending unexposed scene-linear light to the network. R32G32B32_TYPELESS (5) is the only other
+// float member left out. With both added the list is every DXGI float colour format there is.
+//
+// The range check in front of the table becomes a jump to a stub that sends 67 and 5 to the table's
+// own "keep" target and does the original check for everything else; the table is untouched, so the
+// answer for every other format is what it was.
+void fix_float_formats(const Module& m) {
+    // mov ecx,[rax+0x20] (Format) ; dec ecx ; cmp ecx,0x19 ; ja clear ; movsxd rax,ecx ;
+    // lea rdx,[rip+image base] ; movzx eax,byte [rdx+rax+index] ; mov ecx,[rdx+rax*4+targets] ;
+    // add rcx,rdx ; jmp rcx ; clear: mov byte [rbp+0x8d],0 (ColourIsLinearHdr) ; keep:
+    static const uint8_t pat[] = {
+        0x8B, 0x48, 0x20, 0xFF, 0xC9, 0x83, 0xF9, 0x19, 0x77, 0x1E,
+        0x48, 0x63, 0xC1, 0x48, 0x8D, 0x15, 0, 0, 0, 0,
+        0x0F, 0xB6, 0x84, 0x02, 0, 0, 0, 0,
+        0x8B, 0x8C, 0x82, 0, 0, 0, 0,
+        0x48, 0x03, 0xCA, 0xFF, 0xE1,
+        0xC6, 0x85, 0x8D, 0x00, 0x00, 0x00, 0x00};
+    static const char mask[] = "xxxxxxxxxx" "xxxxxx????" "xxxx????" "xxx????" "xxxxx" "xxxxxxx";
+    static_assert(sizeof(pat) == sizeof(mask) - 1, "pattern and mask lengths");
+    constexpr size_t kCheck = 5, kLen = 5;      // cmp ecx,0x19 ; ja clear
+    constexpr size_t kClear = 40, kKeep = sizeof(pat);
+
+    uint8_t* hit = nullptr;
+    const int hits = find_unique(m, pat, mask, sizeof(pat), [](uint8_t*) { return true; }, &hit);
+    if (hits != 1) {
+        log("[nr] OptiScaler fix (float formats): %d matching sites in %ls, nothing changed", hits, m.name);
+        return;
+    }
+    uint8_t* const at = hit + kCheck;
+    uint8_t* const back = at + kLen;
+    uint8_t* const clear = hit + kClear;
+    uint8_t* const keep = hit + kKeep;
+    uint8_t stub[32] = {0x83, 0xF9, 0x42,                        // cmp ecx,67-1 (R9G9B9E5_SHAREDEXP)
+                        0x0F, 0x84, 0, 0, 0, 0,                  // je keep
+                        0x83, 0xF9, 0x04,                        // cmp ecx,5-1 (R32G32B32_TYPELESS)
+                        0x0F, 0x84, 0, 0, 0, 0,                  // je keep
+                        0x83, 0xF9, 0x19,                        // cmp ecx,0x19 (the original check)
+                        0x0F, 0x87, 0, 0, 0, 0,                  // ja clear
+                        0xE9, 0, 0, 0, 0};                       // jmp back (the table)
+    auto* code = static_cast<uint8_t*>(alloc_near(m.base, m.image, sizeof(stub)));
+    auto rel = [](uint8_t* from_end, uint8_t* to, int32_t* out) {
+        const int64_t d = to - from_end;
+        if (d < INT32_MIN || d > INT32_MAX) return false;
+        *out = static_cast<int32_t>(d);
+        return true;
+    };
+    int32_t to_stub = 0, r[4] = {};
+    if (!code || !rel(at + 5, code, &to_stub) || !rel(code + 9, keep, &r[0]) || !rel(code + 18, keep, &r[1]) ||
+        !rel(code + 27, clear, &r[2]) || !rel(code + 32, back, &r[3])) {
+        if (code) VirtualFree(code, 0, MEM_RELEASE);
+        log("[nr] OptiScaler fix (float formats): no memory within reach of %ls, nothing changed", m.name);
+        return;
+    }
+    std::memcpy(stub + 5, &r[0], 4);
+    std::memcpy(stub + 14, &r[1], 4);
+    std::memcpy(stub + 23, &r[2], 4);
+    std::memcpy(stub + 28, &r[3], 4);
+    std::memcpy(code, stub, sizeof(stub));
+    DWORD old = 0;
+    VirtualProtect(code, sizeof(stub), PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(stub));
+    uint8_t jump[kLen] = {0xE9, 0, 0, 0, 0};
+    std::memcpy(jump + 1, &to_stub, 4);
+    if (!write_code(at, jump, sizeof(jump))) {
+        log("[nr] OptiScaler fix (float formats): VirtualProtect failed (%lu)", GetLastError());
+        return;
+    }
+    log("[nr] OptiScaler fix: R9G9B9E5 and R32G32B32 typeless colour count as float for linear HDR (%ls+0x%llx)",
+        m.name, static_cast<unsigned long long>(at - m.base));
+}
+
 }  // namespace
 #endif
 
@@ -689,6 +768,7 @@ void fix_optiscaler() {
     fix_depth_stencil_guide(m);
     fix_autoexposure_hdr(m);
     fix_release_hold(m);
+    fix_float_formats(m);
 #endif
 }
 
