@@ -1,0 +1,68 @@
+name: Windows package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 python3 zip unzip
+
+      - name: Cache pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain
+            artifacts/ref
+            deps/GE-Proton*
+          key: deps-win-${{ hashFiles('fetch_deps.sh') }}
+          restore-keys: deps-win-
+
+      - name: Fetch dependencies (Windows cross-build)
+        run: bash fetch_deps.sh --windows
+
+      - name: Extract model
+        env:
+          MODEL_URL: ${{ secrets.MODEL_URL }}
+        run: |
+          curl -fsSL "$MODEL_URL" -o /tmp/nvngx_dlssnr.zip
+          bash linux/package/model-tools/extract_model.sh /tmp/nvngx_dlssnr.zip dlssnr.bin
+
+      - name: Build package
+        run: NR_MODEL=$PWD/dlssnr.bin bash windows/build/build_package.sh
+
+      # 关键：不管脚本把 zip 吐在哪，都捞出来放到 out/ 里
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find . -maxdepth 3 -type f -name '*.zip' ! -path './out/*' -printf '%p\n'
+          find . -maxdepth 3 -type f -name '*.zip' ! -path './out/*' -exec cp -t out/ {} +
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DLSSNR-AMD-Windows-x64
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/*.zip --clobber
