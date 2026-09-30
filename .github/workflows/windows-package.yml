@@ -1,3 +1,6 @@
+# Windows cross-build package (MinGW on ubuntu-24.04).
+# No model included: dlssnr.bin must be added locally after download.
+# This avoids distributing NVIDIA's weights and needs no secrets.
 name: Windows package
 
 on:
@@ -36,22 +39,14 @@ jobs:
       - name: Fetch dependencies (Windows cross-build)
         run: bash fetch_deps.sh --windows
 
-      - name: Extract model
-        env:
-          MODEL_URL: ${{ secrets.MODEL_URL }}
-        run: |
-          curl -fsSL "$MODEL_URL" -o /tmp/nvngx_dlssnr.zip
-          bash linux/package/model-tools/extract_model.sh /tmp/nvngx_dlssnr.zip dlssnr.bin
-
       - name: Build package
-        run: NR_MODEL=$PWD/dlssnr.bin bash windows/build/build_package.sh
+        run: bash windows/build/build_package.sh
 
-      # 关键：不管脚本把 zip 吐在哪，都捞出来放到 out/ 里
       - name: Collect artifacts
         run: |
           mkdir -p out
-          find . -maxdepth 3 -type f -name '*.zip' ! -path './out/*' -printf '%p\n'
-          find . -maxdepth 3 -type f -name '*.zip' ! -path './out/*' -exec cp -t out/ {} +
+          find . -maxdepth 4 -type f -name '*.zip' ! -path './out/*' -print
+          find . -maxdepth 4 -type f -name '*.zip' ! -path './out/*' -exec cp -t out/ {} +
           ls -lh out/
 
       - uses: actions/upload-artifact@v4
