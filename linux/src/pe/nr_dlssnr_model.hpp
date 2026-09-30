@@ -40,8 +40,7 @@ struct Controls6 {
 };
 
 // A guide subrect: where in the allocation this frame's data is, and how much of it.
-// A non-zero origin cannot be expressed by the pass and falls back to the whole allocation, logged
-// once per guide -- nr_pe_session.cpp apply_guide_subrect.
+// Base and extent are both honoured, as NVIDIA's DLL does -- nr_pe_session.cpp apply_guide_subrect.
 struct Rect {
     unsigned int x = 0, y = 0, width = 0, height = 0;
 };

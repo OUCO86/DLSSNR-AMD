@@ -1540,14 +1540,15 @@ fe4m3vec4 nr_blend_x4(uint i) {
 //     w   = clamp( sigmoid(net channel 3) * clamp(param, 0, 1), 0, 1 )
 //     rgb = lerp( clamp(0.25 * net.rgb + input), history5tap(uv + mv), w )
 //
-// where `param` is a device scalar at +104 that reads as 1.0 when absent. It
-// is the same shape as the external-mask variant: the scalars travel in the
+// where `param` is a device scalar at +104: the model's blend_scale weight
+// (0.7397; 1.0 only when absent), which the host puts into [0].w times the
+// user's history strength. It is the same shape as the external-mask variant: the scalars travel in the
 // buffer at binding 5, and the images move up by one. Production binaries are
 // built without this define and are byte-identical to the validated ones.
 //
 //   [0] = (history and motion are usable, mv scale x, mv scale y, history strength)
 //   [1] = (history width, history height, depth present, depth inverted)
-layout(set=0,binding=5,std430) readonly buffer NrTemporal { vec4 nr_temporal[2]; };
+layout(set=0,binding=5,std430) readonly buffer NrTemporal { vec4 nr_temporal[3]; };
 #if NR_OUT0_NOFORMAT
 // The answer image's format comes from its view: the runtime hands the post
 // block an image in the frame's own format when the store converts exactly as
@@ -3094,7 +3095,7 @@ void main() {
     // arithmetic, which is what lets the first frame stay byte-identical.
     float w=0.0;
     if(nr_temporal[0].x!=0.0) {
-        const vec2 mv=textureLod(nr_motion,uv,0.0).xy*nr_temporal[0].yz;
+        const vec2 mv=textureLod(nr_motion,uv*nr_temporal[2].xy+nr_temporal[2].zw,0.0).xy*nr_temporal[0].yz;
         const vec2 extent=nr_temporal[1].xy;
         const vec3 hist=nr_history_5tap(nr_history,(uv+mv)*extent,vec2(0.5),
                                         extent-0.5,1.0/extent);

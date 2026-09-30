@@ -174,11 +174,13 @@ nr::Controls controls_from(const Controls6& in) {
     return c;
 }
 
-// NGX motion-vector scales convert a texel of the motion buffer into render-resolution pixels
-// (NVSDK_NGX_Parameter_MV_Scale_X), and OptiScaler has already multiplied by workWidth/width so the
-// answer is in *working*-resolution pixels. nr::EngineFrame wants normalized screen units, which is
-// the same number over the working extent -- the same conversion an XeSS caller needs, where the
-// vectors are already in pixels and the scale is 1/inputWidth.
+// The motion vectors times DLSSNR.MVecScale are in pixels of the motion texture's own region (its
+// subrect, else the whole allocation), and nr::EngineFrame wants normalized screen units: the same
+// number over that extent. Not over the colour's: after the upscaler the model runs on the display
+// image while the vectors stay at render resolution, and OptiScaler passes the game's scale through
+// untouched on purpose ("every resource already carries a subrect saying how big it is", its
+// DlssNr_Dx12_Run.cpp). Dividing by the colour width made them half as long at 4K with FSR
+// Performance; before the upscaler the two extents are the same and nothing changes.
 float normalized_mv_scale(float ngx_scale, unsigned int extent) {
     return extent != 0 ? ngx_scale / static_cast<float>(extent) : ngx_scale;
 }
@@ -1010,9 +1012,8 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     resources.depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     // The guide subrects, straight through. Depth takes the render extent, motion takes its own --
     // they differ whenever the game's motion vectors are at display resolution
-    // (DlssNr_Guides.h ResolveGuideRegions, lowResolutionMotion). A non-zero origin cannot be
-    // expressed and falls back to the whole allocation, logged once: nr_pe_session.cpp
-    // apply_guide_subrect.
+    // (DlssNr_Guides.h ResolveGuideRegions, lowResolutionMotion). Base and extent are both honoured,
+    // as NVIDIA's DLL does: nr_pe_session.cpp apply_guide_subrect.
     resources.depth_subrect = to_session(depth_rect);
     resources.motion_subrect = to_session(motion_rect);
     resources.depth_inverted = (depth_inverted != 0) != (debug_depth() == DebugDepth::Flip);
@@ -1029,8 +1030,13 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
         }();
         if (always_reset) resources.reset = true;
     }
-    resources.motion_scale_x = normalized_mv_scale(mv_scale_x, width);
-    resources.motion_scale_y = normalized_mv_scale(mv_scale_y, height);
+    {
+        const D3D12_RESOURCE_DESC md = motion ? motion->GetDesc() : D3D12_RESOURCE_DESC{};
+        const unsigned int mw = motion_rect.width ? motion_rect.width : motion ? unsigned(md.Width) : width;
+        const unsigned int mh = motion_rect.height ? motion_rect.height : motion ? unsigned(md.Height) : height;
+        resources.motion_scale_x = normalized_mv_scale(mv_scale_x, mw);
+        resources.motion_scale_y = normalized_mv_scale(mv_scale_y, mh);
+    }
     // OptiScaler's DlssNr encode has already tone-mapped this proxy into the game's own format
     // (DlssNr_Dx12.cpp DispatchPass -> colorCopy), so a float format here is display-referred, not
     // scene-referred linear light, and the runtime must not encode it again.
@@ -1248,8 +1254,10 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     frame.feature = f->id;
     // The caller's flag and nothing else: every feature has its own history now.
     frame.reset = reset != 0;
-    frame.motion_scale_x = normalized_mv_scale(mv_scale_x, frame.width);
-    frame.motion_scale_y = normalized_mv_scale(mv_scale_y, frame.height);
+    frame.motion_scale_x = normalized_mv_scale(
+        mv_scale_x, motion_rect.width ? motion_rect.width : frame.motion_width ? frame.motion_width : frame.width);
+    frame.motion_scale_y = normalized_mv_scale(
+        mv_scale_y, motion_rect.height ? motion_rect.height : frame.motion_height ? frame.motion_height : frame.height);
 
     f->controls = controls_from(controls);
     f->controls.preprocess = preprocess_now();

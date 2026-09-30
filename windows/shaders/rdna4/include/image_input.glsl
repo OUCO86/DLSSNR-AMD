@@ -38,11 +38,12 @@ layout(set=0,binding=7) uniform sampler2D nr_tex;
 //
 //   [0] = (history and motion are usable, mv scale x, mv scale y, unused)
 //   [1] = (history width, history height, depth present, depth inverted)
+//   [2] = (uv -> motion texture: the region's share of the allocation x, y; its base x, y)
 //
 // Element 0's first component is the whole of the original's gate, resolved on the host:
 // the first-frame latch, DLSSNR.Reset and whether a motion source exists at all.
 // The shader does not re-derive it; there is one place that decision is made.
-layout(set=0,binding=6,std430) readonly buffer NrTemporal { vec4 nr_temporal[2]; };
+layout(set=0,binding=6,std430) readonly buffer NrTemporal { vec4 nr_temporal[3]; };
 layout(set=0,binding=7) uniform sampler2D nr_tex;
 layout(set=0,binding=8) uniform sampler2D nr_motion;
 layout(set=0,binding=9) uniform sampler2D nr_history;
@@ -126,7 +127,9 @@ void nr_prepare_features() {
                 if (inverted ? d>best : d<best) { best=d; muv=at; }
             }
         }
-        const vec2 mv = textureLod(nr_motion,muv,0.0).xy*nr_temporal[0].yz;
+        // The game's vectors in place at full resolution (the region's share of
+        // the allocation and its base in [2]), or the estimator's field ([2] = 1, 1, 0, 0).
+        const vec2 mv = textureLod(nr_motion,muv*nr_temporal[2].xy+nr_temporal[2].zw,0.0).xy*nr_temporal[0].yz;
         const vec2 extent = nr_temporal[1].xy;
         const vec3 hist = nr_history_5tap(nr_history,(uv+mv)*extent,vec2(0.5),
                                           extent-0.5,1.0/extent);

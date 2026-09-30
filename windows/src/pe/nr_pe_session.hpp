@@ -84,8 +84,7 @@ class Session {
         // guide from the resource hands the network the stale margin as well and calls it scene.
         // Zero width or height means "the caller did not say", and the allocation is used.
         //
-        // The base is accepted but can only be honoured when it is zero -- see the note on
-        // apply_guide_subrect in nr_pe_session.cpp.
+        // Base and extent are both honoured (apply_guide_subrect in nr_pe_session.cpp).
         Subrect depth_subrect{};
         Subrect motion_subrect{};
         float motion_scale_x{1.0f}, motion_scale_y{1.0f};

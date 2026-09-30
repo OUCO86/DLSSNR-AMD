@@ -2,6 +2,7 @@
 #include "nr_pe_log.hpp"
 #include "nr_log.hpp"
 #include <windows.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -822,38 +823,43 @@ bool fill(ColourFrame* out, const ResourceHandle& handle) {
     return true;
 }
 
-// Narrow a guide to the part of it the game rendered into.
-//
-// nr::Runtime blits each guide into its own working image with srcOffsets[0] = {0,0} and
-// srcOffsets[1] = {frame.width, frame.height} (linux/src/core/nr_runtime.cpp, the engine branch of
-// record_all). So a subrect whose origin is (0,0) is exactly expressible -- shrink the extent and the
-// blit reads precisely the valid region and scales it, which is what the model is told the guide
-// covers. A subrect with a non-zero origin is NOT expressible: the source rectangle's corner is not a
-// parameter of that blit.
-//
-// UNDICTATED CHOICE, flagged in the report. The reference hands base and extent to NGX and NGX honours
-// both; there is no reference behaviour for "the base cannot be honoured". A non-zero base here keeps
-// the whole allocation -- what this code did before subrects existed -- rather than reading
-// [0, extent), because a translated crop reads the wrong pixels everywhere while the allocation at
-// least contains the valid region. Logged once per guide so it is visible rather than silent.
-void apply_guide_subrect(ColourFrame* guide, const Session::Subrect& want, const char* what) {
+// Narrow a guide to the part of it the game rendered into: its subrect's base and extent, which the
+// runtime reads from (EngineFrame::motion_x/depth_x and the narrowed width/height) - its blits take
+// the region as their source rectangle, the in-place motion sample maps uv into it. A base outside
+// the texture keeps the whole allocation (logged once).
+void apply_guide_subrect(ColourFrame* guide, const Session::Subrect& want, const char* what,
+                         uint32_t* base_x, uint32_t* base_y) {
     if (!guide->image) return;
-    if (want.x != 0 || want.y != 0) {
-        static bool noted[2] = {false, false};
-        const int which = what[0] == 'd' ? 0 : 1;
-        if (!noted[which]) {
-            noted[which] = true;
-            log("[nr] the %s guide's subrect starts at (%u,%u); this pass can only express an "
-                "origin-zero subrect, so the whole %ux%u allocation is used",
-                what, want.x, want.y, guide->width, guide->height);
+    const uint32_t aw = guide->width, ah = guide->height;
+    const int which = what[0] == 'd' ? 0 : 1;
+    if (want.x >= aw || want.y >= ah) {
+        static bool outside[2] = {false, false};
+        if (!outside[which]) {
+            outside[which] = true;
+            log("[nr] the %s guide's subrect starts at (%u,%u), outside its %ux%u texture; the whole texture is used",
+                what, want.x, want.y, aw, ah);
         }
         return;
     }
-    // A narrowed guide is no longer the whole image: the runtime must read it
-    // through its blit, not sample the allocation in place.
-    if ((want.width && want.width < guide->width) || (want.height && want.height < guide->height)) guide->usage = 0;
-    if (want.width && want.width <= guide->width) guide->width = want.width;
-    if (want.height && want.height <= guide->height) guide->height = want.height;
+    // The region the game rendered into: from the base, the given extent (or the
+    // rest of the texture), clipped to the texture - NVIDIA's own reading of the
+    // subrect (base and extent, nvngx_dlssnr.dll 0x180022278).
+    const uint32_t w = want.width ? std::min(want.width, aw - want.x) : aw - want.x;
+    const uint32_t h = want.height ? std::min(want.height, ah - want.y) : ah - want.y;
+    *base_x = want.x; *base_y = want.y;
+    // A depth region that is not the whole image is read through the runtime's
+    // copy, not sampled in place. Motion keeps its usage: it is sampled in place
+    // through the region's base and share of the allocation.
+    if (which == 0 && (w < aw || h < ah)) guide->usage = 0;
+    guide->width = w; guide->height = h;
+    if (want.x || want.y) {
+        static bool noted[2] = {false, false};
+        if (!noted[which]) {
+            noted[which] = true;
+            log("[nr] the %s guide's region starts at (%u,%u): %ux%u of the %ux%u texture", what, want.x, want.y,
+                w, h, aw, ah);
+        }
+    }
 }
 
 }  // namespace
@@ -885,6 +891,28 @@ Session::Session(std::string root) : impl_(std::make_unique<Impl>()) {
     // everything else here writes to.
     nr::set_log_sink([](const char* line) { log("%s", line); });
     log("[nr] session root %s", impl_->root.c_str());
+    // NR_INPUT_CHECK=1 (NR_INPUT_CHECK_DEFAULT for a build that has it on without asking):
+    // score what the game hands the network and what it gets back; pictures in
+    // dlssnr-amd-check\ beside the log. NR_INPUT_CHECK_PICTURES=n sets how many captures
+    // are written as pictures (default 4).
+    static const bool input_check = [] {
+#ifdef NR_INPUT_CHECK_DEFAULT
+        bool on = NR_INPUT_CHECK_DEFAULT != 0;
+#else
+        bool on = false;
+#endif
+        char v[16] = {};
+        if (GetEnvironmentVariableA("NR_INPUT_CHECK", v, sizeof v) > 0) on = v[0] == '1';
+        if (!on) return false;
+        int pictures = 4;
+        if (GetEnvironmentVariableA("NR_INPUT_CHECK_PICTURES", v, sizeof v) > 0) pictures = std::atoi(v);
+        std::string folder = nr::pe::module_folder();
+        folder += folder.empty() ? "dlssnr-amd-check" : "\\dlssnr-amd-check";
+        if (!CreateDirectoryA(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) folder.clear();
+        nr::set_input_check(true, folder, pictures);
+        return true;
+    }();
+    (void)input_check;
 }
 
 void Session::set_white_point(float v) {
@@ -1020,10 +1048,13 @@ ID3D12Resource* Session::run(ID3D12Device* device, ID3D12GraphicsCommandList* li
     engine.depth_inverted = resources.depth_inverted;
     const bool motion_vk = resources.motion &&
         fill(&engine.motion, resource_handle(device, resources.motion, resources.motion_state));
-    if (motion_vk) apply_guide_subrect(&engine.motion, resources.motion_subrect, "motion-vector");
+    if (motion_vk) {
+        engine.motion_texture_width = engine.motion.width; engine.motion_texture_height = engine.motion.height;
+        apply_guide_subrect(&engine.motion, resources.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
+    }
     if (resources.depth &&
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
-        apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth");
+        apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
 
     try {
         // Seed our output with the game's colour, then enhance it in place.
@@ -1102,10 +1133,13 @@ bool Session::run_after(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     engine.depth_inverted = resources.depth_inverted;
     const bool motion_vk = resources.motion &&
         fill(&engine.motion, resource_handle(device, resources.motion, resources.motion_state));
-    if (motion_vk) apply_guide_subrect(&engine.motion, resources.motion_subrect, "motion-vector");
+    if (motion_vk) {
+        engine.motion_texture_width = engine.motion.width; engine.motion_texture_height = engine.motion.height;
+        apply_guide_subrect(&engine.motion, resources.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
+    }
     if (resources.depth &&
         fill(&engine.depth, resource_handle(device, resources.depth, resources.depth_state)))
-        apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth");
+        apply_guide_subrect(&engine.depth, resources.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
     // Full memory barriers on either side of the network, because the caller's
     // barriers are vkd3d's translation of D3D12 resource states and know
     // nothing about ours. Its "UAV -> SRV" on the output waits for compute
@@ -1460,7 +1494,8 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         engine.motion.width = frame.motion_width;
         engine.motion.height = frame.motion_height;
         engine.motion.before = engine.motion.after = frame.motion_layout;
-        apply_guide_subrect(&engine.motion, frame.motion_subrect, "motion-vector");
+        engine.motion_texture_width = engine.motion.width; engine.motion_texture_height = engine.motion.height;
+        apply_guide_subrect(&engine.motion, frame.motion_subrect, "motion-vector", &engine.motion_x, &engine.motion_y);
     }
     if (frame.depth) {
         engine.depth.image = frame.depth;
@@ -1468,7 +1503,7 @@ VkImage Session::run_vulkan(const DeviceHandles& handles, VkCommandBuffer cmd,
         engine.depth.width = frame.depth_width;
         engine.depth.height = frame.depth_height;
         engine.depth.before = engine.depth.after = frame.depth_layout;
-        apply_guide_subrect(&engine.depth, frame.depth_subrect, "depth");
+        apply_guide_subrect(&engine.depth, frame.depth_subrect, "depth", &engine.depth_x, &engine.depth_y);
     }
 
     try {

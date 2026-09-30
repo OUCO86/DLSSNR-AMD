@@ -207,9 +207,9 @@ struct TemporalConfig {
     bool enable = false;
     // The original's post block blends the reprojected previous output into the
     // current one under a weight the network emits, scaled by a device scalar
-    // (its parameter block's +104) that is clamped to [0, 1] and reads as 1.0
-    // when absent. This is that scalar. 0 disables the output-side blend and
-    // leaves only the pre block's history features.
+    // (its parameter block's +104, clamped to [0, 1]): the model's blend_scale,
+    // 0.7397. This multiplies it; 1 is the original. 0 disables the output-side
+    // blend and leaves only the pre block's history features.
     float history_strength = 1.0f;
     // Variant SPIR-V directory; empty selects ROOT/build/windows/rdna4/network/temporal.
     // These are variants, not production binaries: the temporal build
@@ -270,6 +270,12 @@ struct EngineFrame {
     // original's MVecScaleX/Y do.
     ColourFrame motion;
     float motion_scale_x = 1.0f, motion_scale_y = 1.0f;
+    // The motion texture's whole allocation when `motion.width/height` name a
+    // region of it (a subrect); zero: the same extent.
+    uint32_t motion_texture_width = 0, motion_texture_height = 0;
+    // Where the motion and depth regions start in their textures (the subrect
+    // bases, in texels); zero: the origin. `width/height` are the regions'.
+    uint32_t motion_x = 0, motion_y = 0, depth_x = 0, depth_y = 0;
     // The engine's depth buffer, at render resolution. Optional, and it is never
     // a feature of its own: the original samples depth at the centre and four
     // diagonals and reads the motion vector at whichever of the five is nearest
