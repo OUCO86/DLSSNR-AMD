@@ -8,7 +8,7 @@ name: Linux package
 
 on:
   push:
-    branches: [main]
+    branches: [main, win]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
