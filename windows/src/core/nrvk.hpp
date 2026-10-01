@@ -438,16 +438,34 @@ struct Context {
         NRVK_CHECK(vkCreateBuffer(device, &info, nullptr, &b.handle));
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, b.handle, &req);
-        const VkMemoryPropertyFlags want =
-            host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                         : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        const VkMemoryPropertyFlags reject =
-            host_visible ? 0 : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        // Which heap a staging buffer comes out of turns out to matter. On
+        // amdvlk 32.0.32015.2008, staging the 169.7 MB of weights out of
+        // ordinary system memory faults inside the driver -- it dies reading a
+        // pointer out of one of its own linked lists, so the list is already
+        // damaged, which is why the address differs from run to run. The same
+        // transfer staged out of resizable BAR does not fault. This GPU exposes
+        // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT over the whole 16 GB, so
+        // prefer that for staging and fall back to a plain host-visible type
+        // where there is none. NR_STAGE_BAR=0 restores the previous choice.
+        const char* bar_env = std::getenv("NR_STAGE_BAR");
+        const bool prefer_bar = !(bar_env && std::strcmp(bar_env, "0") == 0);
+        const VkMemoryPropertyFlags host_flags =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         uint32_t type = mem.memoryTypeCount;
-        for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
-            const VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
-            if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & reject)) {
-                type = i; break;
+        for (int pass = 0; pass < 2 && type == mem.memoryTypeCount; ++pass) {
+            const VkMemoryPropertyFlags want =
+                host_visible
+                    ? (host_flags | ((pass == 0 && prefer_bar)
+                                         ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                                         : 0))
+                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            const VkMemoryPropertyFlags reject =
+                host_visible ? 0 : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+                const VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
+                if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & reject)) {
+                    type = i; break;
+                }
             }
         }
         // A device with no non-host-visible heap (an iGPU) has nothing to fall
