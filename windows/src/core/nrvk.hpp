@@ -882,27 +882,41 @@ struct Kernel {
         }
         vkUpdateDescriptorSets(device, n, w.data(), 0, nullptr);
 
+        const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         const std::vector<uint32_t> code = read_spirv(spirv_path);
+        NRVK_TRACE(ctx, "[nr] pipeline %s: %u words of SPIR-V", base.c_str(),
+                   unsigned(code.size()));
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         NRVK_CHECK(vkCreateShaderModule(device, &smi, nullptr, &module));
+        NRVK_TRACE(ctx, "[nr] pipeline %s: shader module ok", base.c_str());
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo req{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         req.requiredSubgroupSize = 32;
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        cpi.stage.pNext = &req;
+        // NR_NO_SUBGROUP_SIZE=1: drop the required-subgroup-size request, which
+        // is the one non-default thing this stage asks the driver for. A driver
+        // that mishandles it would do so here, at pipeline creation.
+        const char* no_sub = std::getenv("NR_NO_SUBGROUP_SIZE");
+        if (!(no_sub && *no_sub == '1')) cpi.stage.pNext = &req;
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpi.stage.module = module; cpi.stage.pName = "main";
         cpi.layout = layout;
 #ifndef NR_PIPELINE_STATS
+        NRVK_TRACE(ctx, "[nr] pipeline %s: vkCreateComputePipelines", base.c_str());
         NRVK_CHECK(vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
+        NRVK_TRACE(ctx, "[nr] pipeline %s: built", base.c_str());
+        // NR_PIPE_IDLE=1: wait for the device after every pipeline. If the
+        // driver compiles on its own threads and trips over itself, this is the
+        // cheapest way to see it.
+        if (const char* idle = std::getenv("NR_PIPE_IDLE"))
+            if (*idle == '1') vkDeviceWaitIdle(device);
 #else
         if (ctx.pipeline_stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult made = vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         std::printf("pipeline %s: %s in %.1f ms", base.c_str(), made == VK_SUCCESS ? "built" : "FAILED", ms);
         if (made == VK_SUCCESS && ctx.pipeline_stats) {
             auto props = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
