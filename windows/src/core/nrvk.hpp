@@ -23,18 +23,11 @@
 #include <string>
 #include <algorithm>
 #include <vector>
-#include "nr_log.hpp"
 #ifdef NR_PIPELINE_STATS
 #include <chrono>
 #endif
 
 namespace nrvk {
-
-// NR_TRACE=1 walks the setup path one Vulkan call at a time into the log. It
-// exists because amdvlk 32.0.32015.2008 faults during the weight upload inside
-// its own code, 42 MB above the highest vk* entry point, so no backtrace says
-// which call it was.
-#define NRVK_TRACE(c, ...) do { if ((c).trace) ::nr::logf(__VA_ARGS__); } while (0)
 
 inline void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS)
@@ -70,18 +63,6 @@ struct Context {
     // each submit and nothing else, so a build that spends seconds compiling
     // pipelines does not hold the game's queue for those seconds.
     std::function<void()> queue_lock, queue_unlock;
-    // NR_TRACE=1: log every Vulkan call on the setup path.
-    bool trace = [] {
-        const char* e = std::getenv("NR_TRACE");
-        return e && *e == '1';
-    }();
-    // NR_WEIGHT_HOSTVIS=1: the weight arena is host-visible, so the 170 MB
-    // upload is a memcpy with no staging buffer behind it, and it comes out of
-    // resizable BAR rather than system memory where the GPU can see it.
-    bool host_visible_bar = [] {
-        const char* e = std::getenv("NR_WEIGHT_HOSTVIS");
-        return e && *e == '1';
-    }();
     void submit(const VkSubmitInfo& si, VkFence fence) {
         if (queue_lock) queue_lock();
         const VkResult r = vkQueueSubmit(queue, 1, &si, fence);
@@ -454,35 +435,19 @@ struct Context {
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (device_address) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        NRVK_TRACE(*this, "[nr] vkCreateBuffer %.1f MB (host_visible=%d, device_address=%d)",
-                   double(bytes) / 1e6, int(host_visible), int(device_address));
         NRVK_CHECK(vkCreateBuffer(device, &info, nullptr, &b.handle));
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, b.handle, &req);
-        // An arena is never host-visible; a staging buffer is, and coherent too,
-        // so a write needs no explicit flush. Which heap the staging buffer
-        // comes out of makes no difference to the amdvlk crash this used to
-        // prefer resizable BAR for: measured with NR_STAGE_BAR=1 and =0, both
-        // fault at the same instruction, so the heap is not what trips it.
-        const VkMemoryPropertyFlags base =
-            host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        const VkMemoryPropertyFlags want =
+            host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                          : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         const VkMemoryPropertyFlags reject =
             host_visible ? 0 : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         uint32_t type = mem.memoryTypeCount;
-        for (int pass = 0; pass < 2 && type == mem.memoryTypeCount; ++pass) {
-            // First pass, in the NR_WEIGHT_HOSTVIS mode only: DEVICE_LOCAL as
-            // well, so a host-visible arena is resizable BAR and the GPU still
-            // reads it out of VRAM. Second pass: whatever is host-visible.
-            const VkMemoryPropertyFlags want =
-                base | ((host_visible && host_visible_bar && pass == 0)
-                            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0);
-            for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
-                const VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
-                if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & reject)) {
-                    type = i; break;
-                }
+        for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
+            if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & reject)) {
+                type = i; break;
             }
         }
         // A device with no non-host-visible heap (an iGPU) has nothing to fall
@@ -495,7 +460,6 @@ struct Context {
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         if (device_address) alloc.pNext = &flags;
-        NRVK_TRACE(*this, "[nr] vkAllocateMemory %.1f MB, type %u", double(req.size) / 1e6, type);
         NRVK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &b.memory));
         NRVK_CHECK(vkBindBufferMemory(device, b.handle, b.memory, 0));
         if (device_address) {
@@ -505,92 +469,46 @@ struct Context {
         }
         if (host_visible) {
             NRVK_CHECK(vkMapMemory(device, b.memory, 0, bytes, 0, &b.mapped));
-            NRVK_TRACE(*this, "[nr] vkMapMemory -> %p", b.mapped);
             std::memset(b.mapped, 0, bytes);
         }
         return b;
     }
 
-    // How much of a transfer one staging buffer carries. Chunking was one try
-    // at the amdvlk 32.0.32015.2008 crash and it did not help: 32 MB, 8 MB and
-    // one 170 MB piece all fault at the identical instruction, amdvlk64.dll
-    // +0x2b0fee5, reading the identical 0x15. So the size of the staging buffer
-    // is not what trips it, and neither is the heap it comes out of (measured
-    // with NR_STAGE_BAR=1 and =0, both fault there). What is left is that the
-    // fault is deterministic, not corruption: something hands the driver 21
-    // where it expects a pointer, and it dies dereferencing it.
-    // NR_UPLOAD_CHUNK=0 puts the whole transfer back in one piece.
-    // 0 - one piece, which is what shipped and what the older ICD is happy
-    // with. Chunking did not fix the newer one, so it stays a switch and not a
-    // default: a default has to be the behaviour with the most mileage on it.
-    static VkDeviceSize upload_chunk_bytes() {
-        const char* e = std::getenv("NR_UPLOAD_CHUNK");
-        if (!e || !*e) return 0;
-        const long mb = std::strtol(e, nullptr, 10);
-        return mb > 0 ? VkDeviceSize(mb) * 1024u * 1024u : 0;
-    }
-    // One-shot staged transfer, chopped into upload_chunk_bytes() pieces.
-    // Setup path only - no attempt at overlap, and each staging buffer lives
-    // exactly as long as its own piece does.
+    // One-shot staged transfer. Setup path only - no attempt at overlap, and
+    // the staging buffer lives exactly as long as the copy.
     void transfer(Buffer& gpu, VkDeviceSize offset, void* host, VkDeviceSize bytes, bool to_gpu) {
         if (!bytes) return;
-        // NR_WEIGHT_HOSTVIS=1: the destination is mapped already, so there is
-        // no staging buffer, no copy and no submit - just the write. Kept as a
-        // way round the amdvlk crash: whichever of those three it is, this
-        // skips all of them. The cost is that the GPU reads the weights over
-        // BAR uncached, so it is a workaround, not the default.
-        if (to_gpu && gpu.mapped) {
-            NRVK_TRACE(*this, "[nr] upload %.1f MB straight into the mapped destination",
-                       double(bytes) / 1e6);
-            std::memcpy(static_cast<char*>(gpu.mapped) + offset, host, bytes);
-            return;
-        }
-        const VkDeviceSize chunk = upload_chunk_bytes();
-        const VkDeviceSize piece = chunk ? std::min(chunk, bytes) : bytes;
+        Buffer stage = buffer(bytes, true);
+        if (to_gpu) std::memcpy(stage.mapped, host, bytes);
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         cpi.queueFamilyIndex = family;
         VkCommandPool pool;
         NRVK_CHECK(vkCreateCommandPool(device, &cpi, nullptr, &pool));
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+        VkCommandBuffer cmd;
+        NRVK_CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        NRVK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+        VkBufferCopy region{};
+        region.srcOffset = to_gpu ? 0 : offset;
+        region.dstOffset = to_gpu ? offset : 0;
+        region.size = bytes;
+        vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
+                        to_gpu ? gpu.handle : stage.handle, 1, &region);
+        NRVK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence;
         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
-        for (VkDeviceSize done = 0; done < bytes; done += piece) {
-            const VkDeviceSize n = std::min(piece, bytes - done);
-            NRVK_TRACE(*this, "[nr] upload piece %.1f MB at +%.1f MB (%s)", double(n) / 1e6,
-                       double(done) / 1e6, to_gpu ? "to gpu" : "from gpu");
-            Buffer stage = buffer(n, true);
-            if (to_gpu) std::memcpy(stage.mapped, static_cast<const char*>(host) + done, n);
-            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
-            VkCommandBuffer cmd;
-            NRVK_CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
-            NRVK_TRACE(*this, "[nr]   vkAllocateCommandBuffers ok");
-            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            NRVK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-            VkBufferCopy region{};
-            region.srcOffset = to_gpu ? 0 : offset + done;
-            region.dstOffset = to_gpu ? offset + done : 0;
-            region.size = n;
-            vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
-                            to_gpu ? gpu.handle : stage.handle, 1, &region);
-            NRVK_CHECK(vkEndCommandBuffer(cmd));
-            NRVK_TRACE(*this, "[nr]   vkEndCommandBuffer ok, vkCmdCopyBuffer %.1f MB", double(n) / 1e6);
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-            NRVK_CHECK(vkResetFences(device, 1, &fence));
-            NRVK_TRACE(*this, "[nr]   vkQueueSubmit");
-            submit(si, fence);
-            NRVK_TRACE(*this, "[nr]   vkWaitForFences");
-            NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
-            if (!to_gpu) std::memcpy(static_cast<char*>(host) + done, stage.mapped, n);
-            vkFreeCommandBuffers(device, pool, 1, &cmd);
-            NRVK_TRACE(*this, "[nr]   vkFreeCommandBuffers ok");
-            destroy(stage);
-            NRVK_TRACE(*this, "[nr]   staging destroyed");
-        }
+        submit(si, fence);
+        NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
+        if (!to_gpu) std::memcpy(host, stage.mapped, bytes);
         vkDestroyFence(device, fence, nullptr);
         vkDestroyCommandPool(device, pool, nullptr);
+        destroy(stage);
     }
     void upload(Buffer& b, VkDeviceSize off, const void* data, VkDeviceSize bytes) {
         transfer(b, off, const_cast<void*>(data), bytes, true);
@@ -882,41 +800,27 @@ struct Kernel {
         }
         vkUpdateDescriptorSets(device, n, w.data(), 0, nullptr);
 
-        const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         const std::vector<uint32_t> code = read_spirv(spirv_path);
-        NRVK_TRACE(ctx, "[nr] pipeline %s: %u words of SPIR-V", base.c_str(),
-                   unsigned(code.size()));
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         NRVK_CHECK(vkCreateShaderModule(device, &smi, nullptr, &module));
-        NRVK_TRACE(ctx, "[nr] pipeline %s: shader module ok", base.c_str());
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo req{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         req.requiredSubgroupSize = 32;
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        // NR_NO_SUBGROUP_SIZE=1: drop the required-subgroup-size request, which
-        // is the one non-default thing this stage asks the driver for. A driver
-        // that mishandles it would do so here, at pipeline creation.
-        const char* no_sub = std::getenv("NR_NO_SUBGROUP_SIZE");
-        if (!(no_sub && *no_sub == '1')) cpi.stage.pNext = &req;
+        cpi.stage.pNext = &req;
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpi.stage.module = module; cpi.stage.pName = "main";
         cpi.layout = layout;
 #ifndef NR_PIPELINE_STATS
-        NRVK_TRACE(ctx, "[nr] pipeline %s: vkCreateComputePipelines", base.c_str());
         NRVK_CHECK(vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline));
-        NRVK_TRACE(ctx, "[nr] pipeline %s: built", base.c_str());
-        // NR_PIPE_IDLE=1: wait for the device after every pipeline. If the
-        // driver compiles on its own threads and trips over itself, this is the
-        // cheapest way to see it.
-        if (const char* idle = std::getenv("NR_PIPE_IDLE"))
-            if (*idle == '1') vkDeviceWaitIdle(device);
 #else
         if (ctx.pipeline_stats) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult made = vkCreateComputePipelines(device, ctx.pipeline_cache, 1, &cpi, nullptr, &pipeline);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const std::string base = spirv_path.substr(spirv_path.find_last_of("/\\") + 1);
         std::printf("pipeline %s: %s in %.1f ms", base.c_str(), made == VK_SUCCESS ? "built" : "FAILED", ms);
         if (made == VK_SUCCESS && ctx.pipeline_stats) {
             auto props = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
