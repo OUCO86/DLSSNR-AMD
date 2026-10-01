@@ -83,7 +83,7 @@ bool write_code(uint8_t* at, const void* bytes, size_t n) {
 
 // ---- 1. The device-extension query (see the header) ----------------------------------------------
 void fix_extension_query(const Module& m) {
-    // SupportedDeviceExtensions, OptiScaler-NR v0.8.4 (8802b2b4), MSVC x64:
+    // SupportedDeviceExtensions, OptiScaler-NR v0.8.91 (f45ccf3), MSVC x64:
     //   test rdx,rdx / je        getInstanceProcAddr == nullptr
     //   test r9,r9   / je        physicalDevice == VK_NULL_HANDLE
     //   lea rdx,[rip+name]       "vkEnumerateDeviceExtensionProperties"
@@ -123,7 +123,7 @@ void fix_extension_query(const Module& m) {
 // wrapped_swapchain.cpp LocalPresent returns early on DXVK ("DXVK check, it's here because of
 // upscaler time calculations"): it calls the real Present and returns before the native path's
 //
-//     if (cq && (fg == nullptr || !fg->IsActive() || fg->IsPaused()))
+//     if (cq && !xeFgGamePicture && (fg == nullptr || !fg->IsActive() || fg->IsPaused()))
 //         DlssNr::ApplyToFinishedPicture(pSwapChain, cq);
 //
 // so under Proton - every OptiScaler install of this project - [DlssNr] FinishedPicture never runs:
@@ -132,47 +132,69 @@ void fix_extension_query(const Module& m) {
 // condition, before its Present, and changes nothing else (no D3D overlay, no GPU-time reads, the
 // frame counter where it was).
 //
-// v0.8.4 (8802b2b4), register allocation of LocalPresent at that point: r15 = the swapchain,
-// r14d/r13d = SyncInterval/Flags, r12b = willPresent, rdi = State::currentFG, [rbp+0x80] = cq.
+// v0.8.91 added xeFgGamePicture (fg != nullptr && State::currentFGSwapchain != nullptr &&
+// activeFgOutput == XeFG && swapchainInteropApi == None && fg->Hwnd() == hWnd) to keep XeFG's own
+// app-facing Present from being composited twice. The stub below takes it as false: OptiScaler's
+// XeFG does not run on DXVK/vkd3d-proton, and even where it did the fg->IsActive()/IsPaused terms
+// below would have to pass first.
+//
+// v0.8.91 (f45ccf3), register allocation of LocalPresent at that point: r12 = the swapchain,
+// r15d/r13d = SyncInterval/Flags, r14b = willPresent, rsi = fg, rbx = State::currentFG,
+// [rbp+0x78] = cq, [rbp-0x50] = hWnd.
 // Both the DXVK branch and the native block are matched byte for byte (the native block is where
 // ApplyToFinishedPicture's address and the FG field offsets come from), so any other build is left
 // alone.
 void fix_finished_picture(const Module& m) {
     // test bl,bl (usesDxvk) / je native / the DXVK branch's first five instructions, then its
-    // Present call: mov rax,[r15]; mov r9,[rbp-0x50]; mov r8d,r13d; mov edx,r14d; mov rcx,r15;
+    // Present call: mov rax,[r12]; mov r9,[rbp-0x48]; mov r8d,r13d; mov edx,r15d; mov rcx,r12;
     // test r9,r9; jne +5; call [rax+0x40]
     static const uint8_t branch[] = {
         0x84, 0xDB, 0x0F, 0x84, 0, 0, 0, 0,
-        0x49, 0x8B, 0x07, 0x4C, 0x8B, 0x4D, 0xB0, 0x45, 0x8B, 0xC5, 0x41, 0x8B, 0xD6, 0x49, 0x8B, 0xCF,
+        0x49, 0x8B, 0x04, 0x24, 0x4C, 0x8B, 0x4D, 0xB8, 0x45, 0x8B, 0xC5, 0x41, 0x8B, 0xD7,
+        0x49, 0x8B, 0xCC,
         0x4D, 0x85, 0xC9, 0x75, 0x05, 0xFF, 0x50, 0x40};
-    static const char branch_mask[] = "xxxx????xxxxxxxxxxxxxxxxxxxxxxxx";
+    static const char branch_mask[] = "xxxx????xxxxxxxxxxxxxxxxxxxxxxxxx";
     static_assert(sizeof(branch) == sizeof(branch_mask) - 1, "pattern and mask lengths");
-    // The native block the je lands on: willPresent, TickFrozenCheck, cq, the inlined FG
-    // IsActive/IsPaused, mov rcx,r15; call ApplyToFinishedPicture.
+    // The native block the je lands on: willPresent, TickFrozenCheck, xeFgGamePicture
+    // (State::currentFGSwapchain, activeFgOutput == XeFG, swapchainInteropApi == None,
+    // fg->Hwnd() == hWnd), then cq, the inlined FG IsActive/IsPaused, mov rcx,r12;
+    // call ApplyToFinishedPicture. Every displacement is a wildcard; the State offsets are not.
     static const uint8_t native[] = {
-        0x45, 0x84, 0xE4, 0x0F, 0x84, 0, 0, 0, 0,
-        0xE8, 0, 0, 0, 0,
-        0x48, 0x8B, 0x88, 0x98, 0x09, 0x00, 0x00, 0x48, 0x85, 0xC9, 0x74, 0x06, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x40,
-        0x48, 0x8B, 0x95, 0x80, 0x00, 0x00, 0x00, 0x48, 0x85, 0xD2, 0x74, 0x45,
-        0x48, 0x85, 0xFF, 0x74, 0x33,
-        0x48, 0x8B, 0x47, 0x08, 0x48, 0x63, 0x48, 0x04,
-        0x80, 0xBC, 0x39, 0x25, 0x02, 0x00, 0x00, 0x00, 0x75, 0x0A,
-        0x80, 0xBC, 0x39, 0x18, 0x02, 0x00, 0x00, 0x00, 0x74, 0x17,
-        0x48, 0x8B, 0x84, 0x39, 0x28, 0x02, 0x00, 0x00, 0x48, 0x85, 0xC0, 0x74, 0x17,
-        0x48, 0x3B, 0x84, 0x39, 0x00, 0x02, 0x00, 0x00, 0x72, 0x0D,
-        0x49, 0x8B, 0xCF, 0xE8, 0, 0, 0, 0};
+        0x45, 0x84, 0xF6, 0x0F, 0x84, 0, 0, 0, 0,                                     //  0 willPresent
+        0xE8, 0, 0, 0, 0,                                                             //  9 State::Instance
+        0x48, 0x8B, 0x98, 0x98, 0x09, 0x00, 0x00,                                     // 14 currentFG
+        0x48, 0x85, 0xDB, 0x74, 0,                                                    // 21
+        0xE8, 0, 0, 0, 0,                                                             // 26 State::Instance
+        0x48, 0x8B, 0x88, 0xA0, 0x09, 0x00, 0x00,                                     // 31 currentFeature
+        0x4C, 0x8B, 0x03, 0x48, 0x85, 0xC9, 0x74, 0,                                  // 38
+        0x48, 0x8B, 0x41, 0x08, 0x48, 0x63, 0x50, 0x04,                               // 46
+        0x8B, 0x94, 0x0A, 0x1C, 0x02, 0x00, 0x00,                                     // 54 GetInterpolatedFrameCount
+        0x85, 0xD2, 0x0F, 0x48, 0xD7, 0xEB, 0, 0x8B, 0xD7,                             // 61
+        0x48, 0x8B, 0xCB, 0x41, 0xFF, 0x50, 0x40,                                     // 70 TickFrozenCheck
+        0x48, 0x85, 0xF6, 0x74, 0,                                                    // 77 fg != nullptr
+        0xE8, 0, 0, 0, 0,                                                             // 82 State::Instance
+        0x48, 0x83, 0xB8, 0xC0, 0x09, 0x00, 0x00, 0x00, 0x74, 0,                       // 87 currentFGSwapchain
+        0xE8, 0, 0, 0, 0,                                                             // 97 State::Instance
+        0x83, 0xB8, 0xA4, 0x00, 0x00, 0x00, 0x03, 0x75, 0,                             // 102 activeFgOutput == XeFG
+        0xE8, 0, 0, 0, 0,                                                             // 111 State::Instance
+        0x83, 0xB8, 0x10, 0x06, 0x00, 0x00, 0x00, 0x75, 0,                             // 116 swapchainInteropApi == None
+        0x48, 0x8B, 0x06, 0x48, 0x8B, 0xCE, 0xFF, 0x50, 0x20,                          // 125 fg->Hwnd()
+        0x48, 0x8B, 0x7D, 0xB0, 0x48, 0x3B, 0xC7, 0x75, 0, 0xB0, 0x01, 0xEB, 0,        // 134
+        0x48, 0x8B, 0x7D, 0xB0, 0x32, 0xC0,                                           // 147 xeFgGamePicture = al
+        0x48, 0x8B, 0x55, 0x78, 0x48, 0x85, 0xD2, 0x74, 0,                             // 153 cq
+        0x84, 0xC0, 0x75, 0,                                                          // 162 !xeFgGamePicture
+        0x48, 0x85, 0xF6, 0x74, 0,                                                    // 166 fg == nullptr
+        0x48, 0x8B, 0x46, 0x08, 0x48, 0x63, 0x48, 0x04,                               // 171
+        0x80, 0xBC, 0x31, 0x25, 0x02, 0x00, 0x00, 0x00, 0x75, 0,                       // 179 IsActive
+        0x80, 0xBC, 0x31, 0x18, 0x02, 0x00, 0x00, 0x00, 0x74, 0,                       // 189 IsPaused
+        0x48, 0x8B, 0x84, 0x31, 0x28, 0x02, 0x00, 0x00, 0x48, 0x85, 0xC0, 0x74, 0,     // 199
+        0x48, 0x3B, 0x84, 0x31, 0x00, 0x02, 0x00, 0x00, 0x72, 0,                       // 212
+        0x49, 0x8B, 0xCC, 0xE8, 0, 0, 0, 0};                                          // 222 ApplyToFinishedPicture
     static const char native_mask[] =
-        "xxxxx????"
-        "x????"
-        "xxxxxxxxxxxxxxxxxx"
-        "xxxxxxxxxxxx"
-        "xxxxx"
-        "xxxxxxxx"
-        "xxxxxxxxxx"
-        "xxxxxxxxxx"
-        "xxxxxxxxxxxxx"
-        "xxxxxxxxxx"
-        "xxxx????";
+        "xxxxx????x????xxxxxxxxxxx?x????xxxxxxxxxxxxxx?xxxxxxxxxxxxxxxxxx"
+        "xxx?xxxxxxxxxxxxx?x????xxxxxxxxx?x????xxxxxxxx?x????xxxxxxxx?xxx"
+        "xxxxxxxxxxxxxx?xxx?xxxxxxxxxxxxxx?xxx?xxxx?xxxxxxxxxxxxxxxxx?xxx"
+        "xxxxxx?xxxxxxxxxxxx?xxxxxxxxx?xxxx????";
     static_assert(sizeof(native) == sizeof(native_mask) - 1, "pattern and mask lengths");
 
     uint8_t* site = nullptr;
@@ -190,30 +212,31 @@ void fix_finished_picture(const Module& m) {
     }
 
     uint8_t* const patch = site + 8;          // the DXVK branch's first instruction
-    constexpr size_t kCopied = 16;            // five position-independent instructions
+    constexpr size_t kCopied = 17;            // five position-independent instructions
     uint8_t* const back = patch + kCopied;    // test r9,r9
 
     // The stub: the native block's condition and call, then the five instructions it replaced.
-    uint8_t stub[118];
+    uint8_t stub[117];
     size_t n = 0;
     auto emit = [&](std::initializer_list<uint8_t> b) { for (uint8_t x : b) stub[n++] = x; };
     auto emit64 = [&](uint64_t v) { std::memcpy(stub + n, &v, 8); n += 8; };
-    emit({0x45, 0x84, 0xE4, 0x74, 0x53});                               //  0 test r12b,r12b; jz skip
-    emit({0x48, 0x8B, 0x95, 0x80, 0x00, 0x00, 0x00});                   //  5 mov rdx,[rbp+0x80]
-    emit({0x48, 0x85, 0xD2, 0x74, 0x47});                               // 12 test rdx,rdx; jz skip
-    emit({0x48, 0x85, 0xFF, 0x74, 0x33});                               // 17 test rdi,rdi; jz do
-    emit({0x48, 0x8B, 0x47, 0x08, 0x48, 0x63, 0x48, 0x04});             // 22 fg's virtual-base offset
-    emit({0x80, 0xBC, 0x39, 0x25, 0x02, 0x00, 0x00, 0x00, 0x75, 0x0A}); // 30 cmp; jne L1
-    emit({0x80, 0xBC, 0x39, 0x18, 0x02, 0x00, 0x00, 0x00, 0x74, 0x17}); // 40 cmp; je do
-    emit({0x48, 0x8B, 0x84, 0x39, 0x28, 0x02, 0x00, 0x00,               // 50 L1:
-          0x48, 0x85, 0xC0, 0x74, 0x19});                               // 58 test rax,rax; jz skip
-    emit({0x48, 0x3B, 0x84, 0x39, 0x00, 0x02, 0x00, 0x00, 0x72, 0x0F}); // 63 cmp; jb skip
-    emit({0x49, 0x8B, 0xCF, 0x48, 0xB8});                               // 73 do: mov rcx,r15; mov rax,
+    emit({0x32, 0xC0});                                                 //  0 xor al,al (xeFgGamePicture false)
+    emit({0x48, 0x8B, 0x55, 0x78});                                     //  2 mov rdx,[rbp+0x78] (cq)
+    emit({0x48, 0x85, 0xD2, 0x74, 0x4B});                               //  6 test rdx,rdx; jz skip
+    emit({0x84, 0xC0, 0x75, 0x47});                                     // 11 test al,al; jnz skip
+    emit({0x48, 0x85, 0xF6, 0x74, 0x33});                               // 15 test rsi,rsi; jz do
+    emit({0x48, 0x8B, 0x46, 0x08, 0x48, 0x63, 0x48, 0x04});             // 20 fg's virtual-base offset
+    emit({0x80, 0xBC, 0x31, 0x25, 0x02, 0x00, 0x00, 0x00, 0x75, 0x0A}); // 28 cmp; jne L1
+    emit({0x80, 0xBC, 0x31, 0x18, 0x02, 0x00, 0x00, 0x00, 0x74, 0x17}); // 38 cmp; je do
+    emit({0x48, 0x8B, 0x84, 0x31, 0x28, 0x02, 0x00, 0x00,               // 48 L1:
+          0x48, 0x85, 0xC0, 0x74, 0x19});                               // 56 test rax,rax; jz skip
+    emit({0x48, 0x3B, 0x84, 0x31, 0x00, 0x02, 0x00, 0x00, 0x72, 0x0F}); // 61 cmp; jb skip
+    emit({0x49, 0x8B, 0xCC, 0x48, 0xB8});                               // 71 do: mov rcx,r12; mov rax,
     emit64(reinterpret_cast<uint64_t>(apply));                          //    ApplyToFinishedPicture
-    emit({0xFF, 0xD0});                                                 // 86 call rax
-    for (size_t k = 0; k < kCopied; ++k) stub[n++] = patch[k];          // 88 skip: the replaced code
-    emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});                         // 104 jmp [rip+0]
-    emit64(reinterpret_cast<uint64_t>(back));                           // 110
+    emit({0xFF, 0xD0});                                                 // 84 call rax
+    for (size_t k = 0; k < kCopied; ++k) stub[n++] = patch[k];          // 86 skip: the replaced code
+    emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});                         // 103 jmp [rip+0]
+    emit64(reinterpret_cast<uint64_t>(back));                           // 109
     if (n != sizeof(stub)) {
         log("[nr] OptiScaler fix (finished picture): stub is %zu bytes, expected %zu; nothing changed", n,
             sizeof(stub));
@@ -235,7 +258,7 @@ void fix_finished_picture(const Module& m) {
     jump[0] = 0xFF; jump[1] = 0x25; std::memset(jump + 2, 0, 4);        // jmp [rip+0]
     const uint64_t to = reinterpret_cast<uint64_t>(code);
     std::memcpy(jump + 6, &to, 8);
-    jump[14] = jump[15] = 0x90;
+    jump[14] = jump[15] = jump[16] = 0x90;
     if (!write_code(patch, jump, sizeof(jump))) {
         log("[nr] OptiScaler fix (finished picture): VirtualProtect failed (%lu)", GetLastError());
         return;
@@ -360,7 +383,7 @@ void fix_window_sized_swapchain(const Module& m) {
 // as it is: no clone, no copy. Our side reads the depth aspect of the game's own buffer
 // (nr_pe_interop.cpp depth_stencil_format, runtime_depth.comp); the other guides are untouched.
 void fix_depth_stencil_guide(const Module& m) {
-    // TypedGuideFormat, v0.8.4: a jump table over (f - 9), eight `mov eax,<typed>; ret` cases and the
+    // TypedGuideFormat, v0.8.91: a jump table over (f - 9), eight `mov eax,<typed>; ret` cases and the
     // default `mov eax,edx; ret`. The R24G8_TYPELESS (44) case returns 46 (R24_UNORM_X8_TYPELESS).
     static const uint8_t pat[] = {
         0x8D, 0x42, 0xF7, 0x83, 0xF8, 0x2C, 0x77, 0x4F,
@@ -410,17 +433,20 @@ void fix_depth_stencil_guide(const Module& m) {
 // (flags & (IsHDR | AutoExposure)) != 0; the float-format check after it is unchanged, so 8/10-bit
 // frames are never affected. Kingdom Come: Deliverance II, which sets IsHDR, already took this path.
 void fix_autoexposure_hdr(const Module& m) {
-    // mov ecx,[rbp+0x170] (featureFlags); DepthInverted = flags>>3 & 1; MVLowRes = flags>>1 & 1;
-    // and cl,1 ; mov [rbp+0x8d],cl  <- ColourIsLinearHdr ; lea rdx,[rip+"DLSS.Output"...]
+    // mov ecx,[rbp+0x180] (featureFlags); DepthInverted = flags>>3 & 1; MVLowRes = flags>>1 & 1;
+    // and cl,1 ; mov [rbp+0x6d],cl  <- ColourIsLinearHdr ; lea rdx,[rip+"DLSS.Output"...]
     static const uint8_t pat[] = {
-        0x8B, 0x8D, 0x70, 0x01, 0x00, 0x00, 0x8B, 0xC1, 0xC1, 0xE8, 0x03, 0x24, 0x01,
-        0x88, 0x85, 0x81, 0x00, 0x00, 0x00, 0x8B, 0xC1, 0xD1, 0xE8, 0x24, 0x01,
-        0x88, 0x85, 0xD4, 0x00, 0x00, 0x00,
-        0x80, 0xE1, 0x01, 0x88, 0x8D, 0x8D, 0x00, 0x00, 0x00,
+        0x8B, 0x8D, 0x80, 0x01, 0x00, 0x00, 0x8B, 0xC1, 0xC1, 0xE8, 0x03, 0x24, 0x01,
+        0x88, 0x45, 0x61, 0x8B, 0xC1, 0xD1, 0xE8, 0x24, 0x01,
+        0x88, 0x85, 0xB4, 0x00, 0x00, 0x00,
+        0x80, 0xE1, 0x01, 0x88, 0x4D, 0x6D,
         0x48, 0x8D, 0x15};
-    static const char mask[] = "xxxxxxxxxxxxx" "xxxxxxxxxxxx" "xxxxxx" "xxxxxxxxx" "xxx";
+    static const char mask[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     static_assert(sizeof(pat) == sizeof(mask) - 1, "pattern and mask lengths");
-    constexpr size_t kAnd = 31, kLen = 9;       // and cl,1 ; mov [rbp+0x8d],cl
+    // v0.8.91 stores MVLowRes at [rbp+0xb4] with a disp32 (0xb4 does not fit in a signed disp8), so
+    // that mov is six bytes and `and cl,1` sits at 28 - three further along than in v0.8.4. Patching
+    // at 27 would cut the store's last displacement byte and leave 0x6d to be decoded as `insd`.
+    constexpr size_t kAnd = 28, kLen = 6;       // and cl,1 ; mov [rbp+0x6d],cl
 
     uint8_t* hit = nullptr;
     const int hits = find_unique(m, pat, mask, sizeof(pat), [](uint8_t*) { return true; }, &hit);
@@ -430,9 +456,9 @@ void fix_autoexposure_hdr(const Module& m) {
     }
     uint8_t* const at = hit + kAnd;
     uint8_t* const back = at + kLen;
-    uint8_t stub[17] = {0xF6, 0xC1, 0x41,                        // test cl,IsHDR|AutoExposure
+    uint8_t stub[14] = {0xF6, 0xC1, 0x41,                        // test cl,IsHDR|AutoExposure
                         0x0F, 0x95, 0xC1,                        // setne cl
-                        0x88, 0x8D, 0x8D, 0x00, 0x00, 0x00,      // mov [rbp+0x8d],cl
+                        0x88, 0x4D, 0x6D,                        // mov [rbp+0x6d],cl
                         0xE9, 0, 0, 0, 0};                       // jmp back
     auto* code = static_cast<uint8_t*>(alloc_near(m.base, m.image, sizeof(stub)));
     int32_t to_stub = 0, to_back = 0;
@@ -447,12 +473,12 @@ void fix_autoexposure_hdr(const Module& m) {
         log("[nr] OptiScaler fix (AutoExposure HDR): no memory within reach of %ls, nothing changed", m.name);
         return;
     }
-    std::memcpy(stub + 13, &to_back, 4);
+    std::memcpy(stub + 10, &to_back, 4);
     std::memcpy(code, stub, sizeof(stub));
     DWORD old = 0;
     VirtualProtect(code, sizeof(stub), PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), code, sizeof(stub));
-    uint8_t jump[kLen] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+    uint8_t jump[kLen] = {0xE9, 0, 0, 0, 0, 0x90};
     std::memcpy(jump + 1, &to_stub, 4);
     if (!write_code(at, jump, sizeof(jump))) {
         log("[nr] OptiScaler fix (AutoExposure HDR): VirtualProtect failed (%lu)", GetLastError());
@@ -673,8 +699,9 @@ void fix_release_hold(const Module& m) {
 //
 // Right after the flag test fix 5 changes, MakeDlssNrPass clears ColourIsLinearHdr unless the output
 // (or colour) is one of R32G32B32A32 typeless/float, R32G32B32 float, R16G16B16A16 typeless/float or
-// R11G11B10 float (DlssNr_Pipeline_Dx12.cpp: a switch, compiled into a jump table over formats 1..26
-// whose out-of-range side is the clearing store). R9G9B9E5_SHAREDEXP (67) is float too and is what
+// R11G11B10 float (DlssNr_Pipeline_Dx12.h: FormatCanHoldLinearHdr, a switch compiled into a jump
+// table over formats 1..26 whose out-of-range side returns false). R9G9B9E5_SHAREDEXP (67) is float
+// too and is what
 // RE Engine hands its upscaler: Resident Evil Requiem creates its FSR context with IsHdr set and a
 // format-67 colour, and OptiScaler then logs "the game's DLSS colour space is already tone-mapped",
 // sending unexposed scene-linear light to the network. R32G32B32_TYPELESS (5) is the only other
@@ -684,20 +711,23 @@ void fix_release_hold(const Module& m) {
 // own "keep" target and does the original check for everything else; the table is untouched, so the
 // answer for every other format is what it was.
 void fix_float_formats(const Module& m) {
-    // mov ecx,[rax+0x20] (Format) ; dec ecx ; cmp ecx,0x19 ; ja clear ; movsxd rax,ecx ;
-    // lea rdx,[rip+image base] ; movzx eax,byte [rdx+rax+index] ; mov ecx,[rdx+rax*4+targets] ;
-    // add rcx,rdx ; jmp rcx ; clear: mov byte [rbp+0x8d],0 (ColourIsLinearHdr) ; keep:
+    // v0.8.91 moved the switch into DlssNr::FormatCanHoldLinearHdr (DlssNr_Pipeline_Dx12.h) and
+    // inlined it here, so the out-of-range side is no longer the clearing store but the `false`
+    // arm of the result: mov ecx,[rax+0x20] (Format) ; dec ecx ; cmp ecx,0x19 ; ja clear ;
+    // movsxd rax,ecx ; lea rdx,[rip+image base] ; movzx eax,byte [rdx+rax+index] ;
+    // mov ecx,[rdx+rax*4+targets] ; add rcx,rdx ; jmp rcx ;
+    // keep: mov al,1 ; jmp over ; clear: xor al,al  (then and byte [rbp+0x6d],al)
     static const uint8_t pat[] = {
-        0x8B, 0x48, 0x20, 0xFF, 0xC9, 0x83, 0xF9, 0x19, 0x77, 0x1E,
+        0x8B, 0x48, 0x20, 0xFF, 0xC9, 0x83, 0xF9, 0x19, 0x77, 0x22,
         0x48, 0x63, 0xC1, 0x48, 0x8D, 0x15, 0, 0, 0, 0,
         0x0F, 0xB6, 0x84, 0x02, 0, 0, 0, 0,
         0x8B, 0x8C, 0x82, 0, 0, 0, 0,
         0x48, 0x03, 0xCA, 0xFF, 0xE1,
-        0xC6, 0x85, 0x8D, 0x00, 0x00, 0x00, 0x00};
-    static const char mask[] = "xxxxxxxxxx" "xxxxxx????" "xxxx????" "xxx????" "xxxxx" "xxxxxxx";
+        0xB0, 0x01, 0xEB, 0x02, 0x32, 0xC0};
+    static const char mask[] = "xxxxxxxxxx" "xxxxxx????" "xxxx????" "xxx????" "xxxxx" "xxxxxx";
     static_assert(sizeof(pat) == sizeof(mask) - 1, "pattern and mask lengths");
     constexpr size_t kCheck = 5, kLen = 5;      // cmp ecx,0x19 ; ja clear
-    constexpr size_t kClear = 40, kKeep = sizeof(pat);
+    constexpr size_t kKeep = 40, kClear = 44;   // mov al,1 / xor al,al
 
     uint8_t* hit = nullptr;
     const int hits = find_unique(m, pat, mask, sizeof(pat), [](uint8_t*) { return true; }, &hit);

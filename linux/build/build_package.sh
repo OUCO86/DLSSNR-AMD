@@ -197,7 +197,7 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # Streamline games (007 First Light) lost the DLSS option; renamed, it is selectable again. OptiScaler finds it through
 # [Libraries] NvngxPath, which takes a file path.
 if [[ "$arch" == x86_64 ]]; then
-    opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip}
+    opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip}
     [[ -f "$opti_zip" ]] || { echo "missing $opti_zip" >&2; exit 1; }
     bash linux/build/build_optiscaler_nr.sh artifacts/optiscaler/nr > /dev/null
     mkdir -p -- "$pkg/optiscaler"

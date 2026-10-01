@@ -15,7 +15,7 @@ The fork split, and the two halves reach feature 18 differently. Both are answer
 
 | lineage | how it reaches the model | what it loads |
 | --- | --- | --- |
-| **wilsjo2 ≥ 0.8.1** (`OptiScaler-NR-v0.8.4.zip`, **the bundled one**) | `NVSDK_NGX_D3D12_CreateFeature(cmdList, (NVSDK_NGX_Feature) 18, params, &feature)` on the NGX core, then `D3D12_EvaluateFeature` / `D3D12_ReleaseFeature`. Vulkan: `VULKAN_CreateFeature1` / `VULKAN_EvaluateFeature` / `VULKAN_ReleaseFeature`. | **`_nvngx.dll` only.** Its `INSTALL-DLSSNR.md` says "No NR helper DLL is required; remove the obsolete `nvngx.dll_dlssnr.dll` when upgrading." |
+| **wilsjo2 ≥ 0.8.1** (`OptiScaler-NR-v0.8.91.zip`, **the bundled one**) | `NVSDK_NGX_D3D12_CreateFeature(cmdList, (NVSDK_NGX_Feature) 18, params, &feature)` on the NGX core, then `D3D12_EvaluateFeature` / `D3D12_ReleaseFeature`. Vulkan: `VULKAN_CreateFeature1` / `VULKAN_EvaluateFeature` / `VULKAN_ReleaseFeature`. | **`_nvngx.dll` only.** Its `INSTALL-DLSSNR.md` says "No NR helper DLL is required; remove the obsolete `nvngx.dll_dlssnr.dll` when upgrading." |
 | **Dagherbou** (`OptiScaler-DLSSNR-v0.2.0.zip`) | `dlssnr_call_create` / `_evaluate` / `_release` / `_set_extras` / `_probe_float` / `_set_float_slot` in a forwarder DLL beside itself. | `nvngx.dll_dlssnr.dll`, with `nvngx_dlssnr.dll` as a presence check, plus `_nvngx.dll` for the parameter block. |
 
 Behind both doors is one body of code, `linux/src/pe/nr_dlssnr_model.cpp`: one `nr::pe::Session` per graphics
@@ -46,9 +46,9 @@ linux/package/optiscaler/install_optiscaler_nr.sh <game-dir> <OptiScaler-*.zip> 
 
 The release that ships:
 
-- <https://github.com/wilsjo2/OptiScaler/releases> — `OptiScaler-NR-v0.8.4.zip`
-- sha256 `8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4`
-- source tag `v0.8.4`, HEAD `8802b2b`, cloned to
+- <https://github.com/wilsjo2/OptiScaler/releases> — `OptiScaler-NR-v0.8.91.zip`
+- sha256 `19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77`
+- source tag `v0.8.91`, HEAD `f45ccf3`, cloned to
   `artifacts/ref/wilsjo2-OptiScaler-DLSSNR-PreSR-Multipass`
 
 It is a binary release: `OptiScaler.dll` (26 MB), `OptiScaler.ini`, the `OptiScaler/` library folder,
@@ -135,7 +135,7 @@ time a second handle appears.
 ## The ini keys, and the one that is deliberately left alone
 
 Written by the installer into the archive's own `OptiScaler.ini`. Both ship as `<key>=auto` in
-v0.8.4 and are rewritten in place; a key that has been renamed upstream shows up as an error rather
+v0.8.91 and are rewritten in place; a key that has been renamed upstream shows up as an error rather
 than as a silently ignored line.
 
 ```ini
@@ -166,7 +166,7 @@ NvngxPath=<game-dir>\dlssnr_core.dll
 ## Fixes applied to OptiScaler in memory
 
 OptiScaler itself is shipped as released and never rebuilt. The NGX core corrects five defects of
-OptiScaler-NR v0.8.4 in memory when OptiScaler loads it, before the game creates a Vulkan device or
+OptiScaler-NR v0.8.91 in memory when OptiScaler loads it, before the game creates a Vulkan device or
 presents (`linux/src/pe/nr_pe_optifix.cpp`). Each is found by exact byte signatures; another
 OptiScaler build is left untouched and `dlssnr-amd.log` says so. `NR_OPTISCALER_FIX=0` turns all off.
 

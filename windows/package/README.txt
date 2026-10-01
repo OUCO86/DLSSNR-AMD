@@ -87,5 +87,5 @@ Third-party components
 DXVK (zlib licence) and vkd3d-proton (LGPL-2.1) come from GE-Proton 11-7; the versions are in
 version.txt in their folders. Sources: https://github.com/doitsujin/dxvk ,
 https://github.com/HansKristian-Work/vkd3d-proton . The licence files of ReShade 6.8.0,
-OptiScaler-NR 0.8.4, the Vulkan Loader (with a description of the changes), vort_Shaders and
+OptiScaler-NR 0.8.91, the Vulkan Loader (with a description of the changes), vort_Shaders and
 DLSS5-Feeder are in their folders.

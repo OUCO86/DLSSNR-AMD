@@ -29,7 +29,7 @@ command -v "$cxx" >/dev/null || { echo "no mingw cross compiler ($cxx)" >&2; exi
 minhook=artifacts/ref/DLSS5-Feeder/external/minhook
 reshade_inc=artifacts/ref/DLSS5-Feeder/external/reshade/include
 proton=${NR_PROTON:-toolchain/GE-Proton11-7-x86_64/files}
-opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip}
+opti_zip=${NR_OPTI_ZIP:-artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip}
 for dir in "$minhook" "$reshade_inc" artifacts/ref/reshade-shaders artifacts/ref/vort_Shaders \
            "$proton/lib/wine/dxvk/x86_64-windows" "$proton/lib/wine/vkd3d-proton/x86_64-windows"; do
     [[ -d "$dir" ]] || { echo "missing: $dir" >&2; exit 1; }

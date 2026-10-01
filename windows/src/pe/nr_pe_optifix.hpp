@@ -1,5 +1,5 @@
 #pragma once
-// In-memory fixes for OptiScaler-NR v0.8.4, applied from this module's DllMain - OptiScaler loads it
+// In-memory fixes for OptiScaler-NR v0.8.91, applied from this module's DllMain - OptiScaler loads it
 // during its own initialisation, before the game creates a Vulkan device or presents. OptiScaler's
 // file on disk is not touched, and each fix is found by exact byte signatures: any other build is
 // left alone and the log says so. NR_OPTISCALER_FIX=0 turns them all off.

@@ -84,10 +84,17 @@ da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8  $rs/ReShade32.
 EOF
 get "$rs/ReShade-LICENSE.md" https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md \
     237ded5b8344f820113efab1e65e91e1f159d9202c5b4856606a0590d3ffdab0
-# OptiScaler-NR 0.8.4 (GPL-3.0), the OptiScaler route's host, shipped as released.
-get artifacts/ref/downloads/OptiScaler-NR-v0.8.4.zip \
-    https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.4/OptiScaler-NR-v0.8.4.zip \
-    8789912859882e66b3f3a1aa768db947da779dfd65225df69ea919052e73a2e4
+# OptiScaler-NR 0.8.91 (GPL-3.0), the OptiScaler route's host, shipped as released.
+# 0.8.4 is the last version whose NR proxy gates evaluation on State::frameCount, which only ever
+# advances inside wrapped_swapchain's Present hook. Under vkd3d-proton the game's swapchain is never
+# wrapped (Vulkan_Hooks.cpp wraps o_QueuePresentKHR in ScopedVulkanCreatingSC, and
+# DxgiFactoryHooks::CreateSwapChainForHwnd then returns the raw swapchain), so frameCount stays 0,
+# `ready = submissionEpoch != creationEpoch` is `0 != 0` forever and D3D12_EvaluateFeature is never
+# called. 0.8.91 replaced that test with GpuLifetime::CompletionProbe, a fence, which does not depend
+# on the frame counter at all.
+get artifacts/ref/downloads/OptiScaler-NR-v0.8.91.zip \
+    https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/download/v0.8.91/OptiScaler-NR-v0.8.91.zip \
+    19a2852bb3f88e09075e3ccc66e0318c52e83a5901d9020a10384ae49d59ff77
 
 # ---- Windows package only ---------------------------------------------------------------------
 if [[ $windows == 1 ]]; then

@@ -9,26 +9,28 @@
 //
 // 2. FEATURE 18 ITSELF. From 0.8.1 on, wilsjo2's fork loads no forwarder at all -- its INSTALL-DLSSNR.md
 //    says "No NR helper DLL is required; remove the obsolete nvngx.dll_dlssnr.dll when upgrading" --
-//    and drives the model straight through this core. Verified against the v0.8.4 tree at
-//    artifacts/ref/wilsjo2-OptiScaler-DLSSNR-PreSR-Multipass (tag v0.8.4, HEAD 8802b2b):
+//    and drives the model straight through this core. Verified against the v0.8.91 tree at
+//    artifacts/ref/wilsjo2-OptiScaler-DLSSNR-PreSR-Multipass (tag v0.8.91, HEAD f45ccf3):
 //
-//      dlssnr/DlssNr_Proxy.cpp:154   D3D12_GetCapabilityParameters()(&state.params)   -- ownership to the caller
-//      dlssnr/DlssNr_Proxy.cpp:174   SetCreationParameters(state.params, ...)         -- the DLSSNR.* keys
-//      dlssnr/DlssNr_Proxy.cpp:177   D3D12_CreateFeature()(cmdList, (NVSDK_NGX_Feature) 18,
+//      dlssnr/DlssNr_Proxy.cpp:140   D3D12_GetCapabilityParameters()(&state.params)   -- ownership to the caller
+//      dlssnr/DlssNr_Proxy.cpp:160   SetCreationParameters(state.params, ...)         -- the DLSSNR.* keys
+//      dlssnr/DlssNr_Proxy.cpp:163   D3D12_CreateFeature()(cmdList, (NVSDK_NGX_Feature) 18,
 //                                                          state.params, &state.feature)
-//      dlssnr/DlssNr_Proxy.cpp:280   D3D12_EvaluateFeature()(cmdList, state.feature, params, nullptr)
-//      dlssnr/DlssNr_Proxy.cpp:36-47 D3D12_ReleaseFeature()(state.feature), then D3D12_DestroyParameters()
+//      dlssnr/DlssNr_Proxy.cpp:248   D3D12_EvaluateFeature()(cmdList, state.feature, params, nullptr)
+//      dlssnr/DlssNr_Proxy.cpp:35-40 D3D12_ReleaseFeature()(state.feature), then D3D12_DestroyParameters()
 //
-//    and on Vulkan, dlssnr/DlssNrFeature_Vk_Model.cpp:109 VULKAN_CreateFeature1(device, cmd, 18, ...),
-//    :174 VULKAN_EvaluateFeature(cmd, feature, params, nullptr), :63-67 ReleaseFeature then
+//    and on Vulkan, dlssnr/DlssNrFeature_Vk_Model.cpp:98 VULKAN_CreateFeature1(device, cmd, 18, ...),
+//    :148 VULKAN_EvaluateFeature(cmd, feature, params, nullptr), :63-67 ReleaseFeature then
 //    DestroyParameters.
 //
-//    Two things about create are not optional. `DlssNr_Proxy.cpp:180` falls back to
-//    `DlssNr_CompatibilityRuntime` -- which LoadLibrary's NVIDIA's own nvngx_dlssnr.dll -- when and only
-//    when create fails AND leaves the handle null, so our create must return Success with a non-null
-//    handle or an AMD machine starts loading an NVIDIA runtime. And `DlssNrFeature_Vk_Model.cpp:111-126`
-//    rejects the whole pass if two live handles share a pointer OR an `NVSDK_NGX_Handle::Id`, because
-//    identical-profile passes still need independent temporal histories. Both are honoured below.
+//    Two things about create are not optional. `DlssNr_Proxy.cpp:168` falls back to
+//    `DlssNr::CompatibilityRuntime::TryOpen` -- which LoadLibrary's NVIDIA's own nvngx_dlssnr.dll --
+//    when and only when create fails AND leaves the handle null (the guard at :179 tests
+//    `created != Success || state.feature == nullptr`), so our create must return Success with a
+//    non-null handle or an AMD machine starts loading an NVIDIA runtime. And
+//    `DlssNrFeature_Vk_Model.cpp:103-116` rejects the whole pass if two live handles share a pointer
+//    OR an `NVSDK_NGX_Handle::Id`, because identical-profile passes still need independent temporal
+//    histories. Both are honoured below.
 //
 // What it must NOT do is make OptiScaler believe real DLSS is available. It does not, and cannot --
 // see the note on DLSS gating at the bottom of this file.
@@ -623,7 +625,7 @@ NR_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D12_GetScratchBufferSize(NVSDK_NGX_Featur
                                                                 size_t* out) {
     if (!out) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     // Nothing on this side ever uses a scratch buffer -- the network owns its own memory -- and
-    // wilsjo2 never asks: grep GetScratchBufferSize over the v0.8.4 tree has no hit in dlssnr/ or
+    // wilsjo2 never asks: grep GetScratchBufferSize over the v0.8.91 tree has no hit in dlssnr/ or
     // shaders/dlssnr/. The answer stays the same small number for every feature, 18 included.
     *out = kScratchBytes;
     return NVSDK_NGX_Result_Success;

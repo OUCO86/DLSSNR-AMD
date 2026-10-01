@@ -12,7 +12,7 @@ its licence file.
 | [ReShade](https://github.com/crosire/reshade) 6.8.0 | BSD-3-Clause | Add-on headers; `ReShade32/64.dll` shipped in the ReShade routes. |
 | [reshade-shaders](https://github.com/crosire/reshade-shaders) | BSD-3-Clause | `ReShade.fxh`, `ReShadeUI.fxh` shipped. |
 | [vort_Shaders](https://github.com/vortigern11/vort_Shaders) | MIT | Motion vectors for the ReShade routes, shipped. |
-| [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) 0.8.4 | GPL-3.0 | The OptiScaler route's host, shipped as released; this project's DLLs are separate modules it loads. |
+| [OptiScaler-NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) 0.8.91 | GPL-3.0 | The OptiScaler route's host, shipped as released; this project's DLLs are separate modules it loads. |
 | [Vulkan-Loader](https://github.com/KhronosGroup/Vulkan-Loader) 1.4.357 | Apache-2.0 | Built with the patches in `*/vulkan-loader/` and shipped; the changes are stated in `PATCHES.diff`. |
 | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) 1.4.357 | Apache-2.0 / MIT | Build only. |
 | [glslang](https://github.com/KhronosGroup/glslang) 16.5.0 | BSD-3-Clause and others | Build only (GLSL -> SPIR-V). |
