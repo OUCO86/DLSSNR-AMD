@@ -50,9 +50,9 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p out
-          find . -maxdepth 4 -type f -name '*.zip' ! -path './out/*' -print
-          find . -maxdepth 4 -type f -name '*.zip' ! -path './out/*' -exec cp -t out/ {} +
+          cp -v windows/package/DLSSNR-AMD-*.zip out/
           ls -lh out/
+
 
       - uses: actions/upload-artifact@v4
         with:
