@@ -3564,7 +3564,19 @@ int NrSession::build(int argc, char** argv, const std::vector<Step>* prepared_pl
         act_total += align(prof_words * 4, 256);
         std::printf("NR_PROF region: word offset %zu, %zu words\n", prof_off, prof_words);
     }
-    act = ctx.buffer(act_total, false, /*device_address=*/true); wgt = ctx.buffer(wblob.size());
+    // NR_WEIGHT_HOSTVIS=1: the weight arena itself is host-visible, which turns
+    // the 170 MB upload into a memcpy and drops the staging buffer, the copy and
+    // the submit entirely. That is the whole point: on amdvlk 32.0.32015.2008
+    // the upload faults inside the driver on a borrowed (vkd3d) device, and
+    // chunking it changed nothing, so this is the narrowest way to find out
+    // which part of the staged transfer it is. Reading weights over BAR is
+    // slower than reading them out of VRAM, hence opt-in.
+    const char* weight_hostvis = std::getenv("NR_WEIGHT_HOSTVIS");
+    const bool weight_mapped = weight_hostvis && *weight_hostvis == '1';
+    act = ctx.buffer(act_total, false, /*device_address=*/true);
+    wgt = ctx.buffer(wblob.size(), weight_mapped);
+    if (weight_mapped)
+        nr::logf("[nr] weight arena is host-visible: the upload is a direct write");
     // vit_attn.comp NR_VBDA reads V through a buffer_reference: the arena's address goes into
     // every vitattn push block (PushVAttn::act_lo/act_hi).
     nr::logf("[nr] activation arena through its device address: %s",

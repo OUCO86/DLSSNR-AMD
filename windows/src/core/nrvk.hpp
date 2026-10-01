@@ -23,11 +23,18 @@
 #include <string>
 #include <algorithm>
 #include <vector>
+#include "nr_log.hpp"
 #ifdef NR_PIPELINE_STATS
 #include <chrono>
 #endif
 
 namespace nrvk {
+
+// NR_TRACE=1 walks the setup path one Vulkan call at a time into the log. It
+// exists because amdvlk 32.0.32015.2008 faults during the weight upload inside
+// its own code, 42 MB above the highest vk* entry point, so no backtrace says
+// which call it was.
+#define NRVK_TRACE(c, ...) do { if ((c).trace) ::nr::logf(__VA_ARGS__); } while (0)
 
 inline void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS)
@@ -63,6 +70,18 @@ struct Context {
     // each submit and nothing else, so a build that spends seconds compiling
     // pipelines does not hold the game's queue for those seconds.
     std::function<void()> queue_lock, queue_unlock;
+    // NR_TRACE=1: log every Vulkan call on the setup path.
+    bool trace = [] {
+        const char* e = std::getenv("NR_TRACE");
+        return e && *e == '1';
+    }();
+    // NR_WEIGHT_HOSTVIS=1: the weight arena is host-visible, so the 170 MB
+    // upload is a memcpy with no staging buffer behind it, and it comes out of
+    // resizable BAR rather than system memory where the GPU can see it.
+    bool host_visible_bar = [] {
+        const char* e = std::getenv("NR_WEIGHT_HOSTVIS");
+        return e && *e == '1';
+    }();
     void submit(const VkSubmitInfo& si, VkFence fence) {
         if (queue_lock) queue_lock();
         const VkResult r = vkQueueSubmit(queue, 1, &si, fence);
@@ -435,6 +454,8 @@ struct Context {
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (device_address) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        NRVK_TRACE(*this, "[nr] vkCreateBuffer %.1f MB (host_visible=%d, device_address=%d)",
+                   double(bytes) / 1e6, int(host_visible), int(device_address));
         NRVK_CHECK(vkCreateBuffer(device, &info, nullptr, &b.handle));
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, b.handle, &req);
@@ -443,17 +464,25 @@ struct Context {
         // comes out of makes no difference to the amdvlk crash this used to
         // prefer resizable BAR for: measured with NR_STAGE_BAR=1 and =0, both
         // fault at the same instruction, so the heap is not what trips it.
-        const VkMemoryPropertyFlags want =
+        const VkMemoryPropertyFlags base =
             host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                          : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         const VkMemoryPropertyFlags reject =
             host_visible ? 0 : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         uint32_t type = mem.memoryTypeCount;
-        for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
-            const VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
-            if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & reject)) {
-                type = i; break;
+        for (int pass = 0; pass < 2 && type == mem.memoryTypeCount; ++pass) {
+            // First pass, in the NR_WEIGHT_HOSTVIS mode only: DEVICE_LOCAL as
+            // well, so a host-visible arena is resizable BAR and the GPU still
+            // reads it out of VRAM. Second pass: whatever is host-visible.
+            const VkMemoryPropertyFlags want =
+                base | ((host_visible && host_visible_bar && pass == 0)
+                            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0);
+            for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+                const VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
+                if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & reject)) {
+                    type = i; break;
+                }
             }
         }
         // A device with no non-host-visible heap (an iGPU) has nothing to fall
@@ -466,6 +495,7 @@ struct Context {
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         if (device_address) alloc.pNext = &flags;
+        NRVK_TRACE(*this, "[nr] vkAllocateMemory %.1f MB, type %u", double(req.size) / 1e6, type);
         NRVK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &b.memory));
         NRVK_CHECK(vkBindBufferMemory(device, b.handle, b.memory, 0));
         if (device_address) {
@@ -475,26 +505,27 @@ struct Context {
         }
         if (host_visible) {
             NRVK_CHECK(vkMapMemory(device, b.memory, 0, bytes, 0, &b.mapped));
+            NRVK_TRACE(*this, "[nr] vkMapMemory -> %p", b.mapped);
             std::memset(b.mapped, 0, bytes);
         }
         return b;
     }
 
-    // How much of a transfer one staging buffer carries. amdvlk 32.0.32015.2008
-    // faults inside its own allocator when the setup path asks for one 170 MB
-    // host-visible buffer while the game is submitting frames: it reads a
-    // pointer out of an internal linked list and dies on it, and that pointer
-    // is different nonsense every run (0xffffffffffffffff once, 0x15 the next),
-    // which is corruption, not a rejected argument. Three things bound it. The
-    // same build is happy with the 33.2 MB staging buffer the input image uses.
-    // A bare Vulkan program gets away with 170 MB when nothing else is running.
-    // And staging out of resizable BAR instead of system memory changes
-    // nothing, so the heap is not what trips it. That leaves a large allocation
-    // on a device under load, and smaller pieces take another path through the
-    // allocator. NR_UPLOAD_CHUNK=0 puts the whole transfer back in one piece.
+    // How much of a transfer one staging buffer carries. Chunking was one try
+    // at the amdvlk 32.0.32015.2008 crash and it did not help: 32 MB, 8 MB and
+    // one 170 MB piece all fault at the identical instruction, amdvlk64.dll
+    // +0x2b0fee5, reading the identical 0x15. So the size of the staging buffer
+    // is not what trips it, and neither is the heap it comes out of (measured
+    // with NR_STAGE_BAR=1 and =0, both fault there). What is left is that the
+    // fault is deterministic, not corruption: something hands the driver 21
+    // where it expects a pointer, and it dies dereferencing it.
+    // NR_UPLOAD_CHUNK=0 puts the whole transfer back in one piece.
+    // 0 - one piece, which is what shipped and what the older ICD is happy
+    // with. Chunking did not fix the newer one, so it stays a switch and not a
+    // default: a default has to be the behaviour with the most mileage on it.
     static VkDeviceSize upload_chunk_bytes() {
         const char* e = std::getenv("NR_UPLOAD_CHUNK");
-        if (!e || !*e) return VkDeviceSize(32) * 1024u * 1024u;
+        if (!e || !*e) return 0;
         const long mb = std::strtol(e, nullptr, 10);
         return mb > 0 ? VkDeviceSize(mb) * 1024u * 1024u : 0;
     }
@@ -503,6 +534,17 @@ struct Context {
     // exactly as long as its own piece does.
     void transfer(Buffer& gpu, VkDeviceSize offset, void* host, VkDeviceSize bytes, bool to_gpu) {
         if (!bytes) return;
+        // NR_WEIGHT_HOSTVIS=1: the destination is mapped already, so there is
+        // no staging buffer, no copy and no submit - just the write. Kept as a
+        // way round the amdvlk crash: whichever of those three it is, this
+        // skips all of them. The cost is that the GPU reads the weights over
+        // BAR uncached, so it is a workaround, not the default.
+        if (to_gpu && gpu.mapped) {
+            NRVK_TRACE(*this, "[nr] upload %.1f MB straight into the mapped destination",
+                       double(bytes) / 1e6);
+            std::memcpy(static_cast<char*>(gpu.mapped) + offset, host, bytes);
+            return;
+        }
         const VkDeviceSize chunk = upload_chunk_bytes();
         const VkDeviceSize piece = chunk ? std::min(chunk, bytes) : bytes;
         VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -514,12 +556,15 @@ struct Context {
         NRVK_CHECK(vkCreateFence(device, &fi, nullptr, &fence));
         for (VkDeviceSize done = 0; done < bytes; done += piece) {
             const VkDeviceSize n = std::min(piece, bytes - done);
+            NRVK_TRACE(*this, "[nr] upload piece %.1f MB at +%.1f MB (%s)", double(n) / 1e6,
+                       double(done) / 1e6, to_gpu ? "to gpu" : "from gpu");
             Buffer stage = buffer(n, true);
             if (to_gpu) std::memcpy(stage.mapped, static_cast<const char*>(host) + done, n);
             VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
             cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
             VkCommandBuffer cmd;
             NRVK_CHECK(vkAllocateCommandBuffers(device, &cai, &cmd));
+            NRVK_TRACE(*this, "[nr]   vkAllocateCommandBuffers ok");
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             NRVK_CHECK(vkBeginCommandBuffer(cmd, &bi));
@@ -530,14 +575,19 @@ struct Context {
             vkCmdCopyBuffer(cmd, to_gpu ? stage.handle : gpu.handle,
                             to_gpu ? gpu.handle : stage.handle, 1, &region);
             NRVK_CHECK(vkEndCommandBuffer(cmd));
+            NRVK_TRACE(*this, "[nr]   vkEndCommandBuffer ok, vkCmdCopyBuffer %.1f MB", double(n) / 1e6);
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
             NRVK_CHECK(vkResetFences(device, 1, &fence));
+            NRVK_TRACE(*this, "[nr]   vkQueueSubmit");
             submit(si, fence);
+            NRVK_TRACE(*this, "[nr]   vkWaitForFences");
             NRVK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 30000000000ull));
             if (!to_gpu) std::memcpy(static_cast<char*>(host) + done, stage.mapped, n);
             vkFreeCommandBuffers(device, pool, 1, &cmd);
+            NRVK_TRACE(*this, "[nr]   vkFreeCommandBuffers ok");
             destroy(stage);
+            NRVK_TRACE(*this, "[nr]   staging destroyed");
         }
         vkDestroyFence(device, fence, nullptr);
         vkDestroyCommandPool(device, pool, nullptr);
